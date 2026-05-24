@@ -2,9 +2,26 @@ import { getQwenHeaders, getBasicHeaders } from './playwright.ts';
 import { v4 as uuidv4 } from 'uuid';
 import modelSpecs from '../models.json' with { type: 'json' };
 import type { ModelSpec } from '../types/openai.ts';
-import { withRetry } from '../utils/retry.ts';
+import { withRetry, CircuitBreaker, CircuitOpenError } from '../utils/retry.ts';
 import { throttleAccount, pickAccount, getAllAccountEmails } from './auth.ts';
 import { createNetworkEntry, recordResponse, recordStreamChunk, completeEntry, errorEntry } from './networkDebug.ts';
+
+const QWEN_FETCH_TIMEOUT_MS = parseInt(process.env.QWEN_FETCH_TIMEOUT_MS || '30000', 10);
+
+function createFetchTimeout(): { controller: AbortController; cleanup: () => void } {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), QWEN_FETCH_TIMEOUT_MS);
+  return {
+    controller,
+    cleanup: () => clearTimeout(timeout),
+  };
+}
+
+const qwenCircuitBreaker = new CircuitBreaker('qwen-api', {
+  failureThreshold: 5,
+  resetTimeoutMs: 30_000,
+  halfOpenMaxAttempts: 1,
+});
 
 export class RetryableQwenStreamError extends Error {
   readonly retryAfterMs: number;
@@ -116,11 +133,18 @@ export async function disableNativeTools(): Promise<void> {
         category: 'settings',
       });
       settingsDebugId = settingsDebugEntry.id;
-      const response = await fetch('https://chat.qwen.ai/api/v2/users/user/settings/update', {
-        method: 'POST',
-        headers: settingsHeaders,
-        body: JSON.stringify(payload)
-      });
+      const { controller, cleanup } = createFetchTimeout();
+      let response: Response;
+      try {
+        response = await fetch('https://chat.qwen.ai/api/v2/users/user/settings/update', {
+          method: 'POST',
+          headers: settingsHeaders,
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+      } finally {
+        cleanup();
+      }
       recordResponse(settingsDebugId, response);
       if (!response.ok) {
         const text = await response.text();
@@ -189,11 +213,18 @@ export async function disablePersonalization(): Promise<void> {
           category: 'settings',
         });
         settingsDebugId = settingsDebugEntry.id;
-        const response = await fetch('https://chat.qwen.ai/api/v2/users/user/settings/update', {
-          method: 'POST',
-          headers: settingsHeaders,
-          body: JSON.stringify(payload),
-        });
+        const { controller, cleanup } = createFetchTimeout();
+        let response: Response;
+        try {
+          response = await fetch('https://chat.qwen.ai/api/v2/users/user/settings/update', {
+            method: 'POST',
+            headers: settingsHeaders,
+            body: JSON.stringify(payload),
+            signal: controller.signal,
+          });
+        } finally {
+          cleanup();
+        }
         recordResponse(settingsDebugId, response);
         if (!response.ok) {
           const text = await response.text();
@@ -243,9 +274,16 @@ export async function fetchQwenModels(): Promise<any[]> {
         category: 'models',
       });
       modelsDebugId = modelsDebugEntry.id;
-      const response = await fetch('https://chat.qwen.ai/api/models', {
-        headers: modelsHeaders
-      });
+      const { controller, cleanup } = createFetchTimeout();
+      let response: Response;
+      try {
+        response = await fetch('https://chat.qwen.ai/api/models', {
+          headers: modelsHeaders,
+          signal: controller.signal,
+        });
+      } finally {
+        cleanup();
+      }
       recordResponse(modelsDebugId, response);
 
       if (!response.ok) {
@@ -410,11 +448,17 @@ export async function createQwenStream(
     try {
     let response: Response;
     try {
-      response = await fetch(url, {
-        method: 'POST',
-        headers: requestHeaders,
-        body: JSON.stringify(payload)
-      });
+      const { controller, cleanup } = createFetchTimeout();
+      try {
+        response = await fetch(url, {
+          method: 'POST',
+          headers: requestHeaders,
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+      } finally {
+        cleanup();
+      }
     } catch (fetchErr: unknown) {
       const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
       errorEntry(debugEntry.id, msg);
@@ -509,10 +553,18 @@ export async function createQwenStream(
 
   let result: { response: Response; headers: Record<string, string> };
 
+  const cbState = qwenCircuitBreaker.getState();
+  if (cbState === 'open') {
+    const stats = qwenCircuitBreaker.getStats();
+    const retryAfterMs = Math.max(0, 30_000 - (Date.now() - stats.lastFailureTime));
+    throw new CircuitOpenError(retryAfterMs);
+  }
+
   if (retriesEnabled && retryConfig.maxRetries > 0) {
-    result = await withRetry(makeRequest, retryConfig);
+    result = await withRetry(makeRequest, { ...retryConfig, circuitBreaker: qwenCircuitBreaker });
   } else {
     result = await makeRequest();
+    qwenCircuitBreaker.recordSuccess();
   }
 
   if (!result.response.body) {

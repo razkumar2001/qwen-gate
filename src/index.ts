@@ -5,7 +5,7 @@ import { bearerAuth } from 'hono/bearer-auth';
 import { chatCompletions } from './routes/chat.ts';
 import { fetchQwenModels, disableNativeTools, disablePersonalization } from './services/qwen.ts';
 import * as dotenv from 'dotenv';
-import { initPlaywright, activePage, BrowserType, getQwenHeaders } from './services/playwright.ts';
+import { initPlaywright, activePage, BrowserType, getQwenHeaders, closePlaywright } from './services/playwright.ts';
 import { initAuth, getAccountStats, getAccountCount, getAvailableCount } from './services/auth.ts';
 import { networkInterfaces } from 'os';
 import { resolve } from 'path';
@@ -17,6 +17,48 @@ import { debugNetworkApp } from './routes/debugNetwork.ts';
 dotenv.config();
 
 export const app = new Hono();
+
+let inFlightRequests = 0;
+let isShuttingDown = false;
+let serverInstance: ReturnType<typeof serve> | null = null;
+const SHUTDOWN_TIMEOUT_MS = 30_000;
+
+app.use('*', async (c, next) => {
+  if (isShuttingDown) {
+    return c.json({ error: { message: 'Server is shutting down' } }, 503);
+  }
+  inFlightRequests++;
+  try {
+    await next();
+  } finally {
+    inFlightRequests--;
+  }
+});
+
+async function gracefulShutdown(signal: string): Promise<void> {
+  if (isShuttingDown) {
+    console.log(`[Shutdown] ${signal} received again, forcing exit...`);
+    process.exit(1);
+  }
+  isShuttingDown = true;
+  console.log(`\n[Shutdown] ${signal} received, in-flight: ${inFlightRequests}`);
+  if (serverInstance) {
+    try { (serverInstance as any).close?.(); } catch {}
+  }
+  if (inFlightRequests > 0) {
+    const start = Date.now();
+    while (inFlightRequests > 0 && (Date.now() - start) < SHUTDOWN_TIMEOUT_MS) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
+  try { await closePlaywright(); } catch (err: any) {
+    console.error('[Shutdown] Playwright close error:', err.message);
+  }
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 app.use('*', cors());
 
@@ -172,7 +214,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     });
     console.log('');
 
-    serve({
+    serverInstance = serve({
       fetch: app.fetch,
       port
     });

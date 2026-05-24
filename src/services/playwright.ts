@@ -80,7 +80,7 @@ export async function getBasicHeaders(email?: string): Promise<{ cookie: string,
   
   // P0: Use cached userAgent (never changes during browser lifetime)
   if (!cachedUserAgent) {
-    cachedUserAgent = await activePage.evaluate(() => navigator.userAgent);
+    cachedUserAgent = await activePage.evaluate(() => navigator.userAgent, { timeout: 10_000 } as any);
   }
   
   let cookieStr = await getCookies();
@@ -234,7 +234,7 @@ export async function loginToQwen(email: string, password: string): Promise<bool
   // Qwen expects SHA256 hashed password
   const hashedPassword = crypto.createHash('sha256').update(password).digest('hex');
 
-  const result = await page.evaluate(async ({ email, password }) => {
+    const result = await page.evaluate(async ({ email, password }) => {
     try {
       const response = await fetch("https://chat.qwen.ai/api/v2/auths/signin", {
         method: "POST",

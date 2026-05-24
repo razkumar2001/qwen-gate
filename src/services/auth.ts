@@ -3,6 +3,17 @@ import path from 'path';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'fs';
 import { activePage } from './playwright.ts';
 
+const AUTH_FETCH_TIMEOUT_MS = parseInt(process.env.QWEN_FETCH_TIMEOUT_MS || '30000', 10);
+
+function createAuthFetchTimeout(): { controller: AbortController; cleanup: () => void } {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), AUTH_FETCH_TIMEOUT_MS);
+  return {
+    controller,
+    cleanup: () => clearTimeout(timeout),
+  };
+}
+
 // ─── Login Mutex ────────────────────────────────────────────────────────────────
 // Serialize browser-context logins: only one activePage, cookie clearing is global.
 // Local implementation to avoid circular dependency with playwright.ts.
@@ -199,6 +210,7 @@ export function isAccountThrottled(email: string): boolean {
 async function tryRefreshToken(acct: AccountEntry): Promise<boolean> {
   if (!acct.state?.refreshToken) return false;
 
+  const { controller, cleanup } = createAuthFetchTimeout();
   try {
     const response = await fetch('https://chat.qwen.ai/api/v2/auths/refresh', {
       method: 'POST',
@@ -209,6 +221,7 @@ async function tryRefreshToken(acct: AccountEntry): Promise<boolean> {
         'x-request-id': crypto.randomUUID(),
       },
       body: JSON.stringify({ refresh_token: acct.state.refreshToken }),
+      signal: controller.signal,
     });
 
     if (response.ok) {
@@ -226,6 +239,8 @@ async function tryRefreshToken(acct: AccountEntry): Promise<boolean> {
     return false;
   } catch {
     return false;
+  } finally {
+    cleanup();
   }
 }
 
@@ -308,18 +323,26 @@ async function loginFreshViaBrowser(email: string, hashedPassword: string): Prom
     let evalResult: { ok: boolean; status: number; token: string | null; refreshToken: string | null; dataKeys: string[] };
     try {
       evalResult = await activePage.evaluate(async ({ email, hashedPassword }: { email: string; hashedPassword: string }) => {
-        const response = await fetch('https://chat.qwen.ai/api/v2/auths/signin', {
-          method: 'POST',
-          headers: {
-            'accept': 'application/json, text/plain, */*',
-            'content-type': 'application/json',
-            'source': 'web',
-            'timezone': Intl.DateTimeFormat().resolvedOptions().timeZone,
-            'x-request-id': crypto.randomUUID(),
-          },
-          credentials: 'include',
-          body: JSON.stringify({ email, password: hashedPassword, login_type: 'email' }),
-        });
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30_000);
+        let response: Response;
+        try {
+          response = await fetch('https://chat.qwen.ai/api/v2/auths/signin', {
+            method: 'POST',
+            headers: {
+              'accept': 'application/json, text/plain, */*',
+              'content-type': 'application/json',
+              'source': 'web',
+              'timezone': Intl.DateTimeFormat().resolvedOptions().timeZone,
+              'x-request-id': crypto.randomUUID(),
+            },
+            credentials: 'include',
+            body: JSON.stringify({ email, password: hashedPassword, login_type: 'email' }),
+            signal: controller.signal,
+          });
+        } finally {
+          clearTimeout(timeoutId);
+        }
 
         let data: any = {};
         try { data = await response.json(); } catch {} // expected — non-JSON responses fall back to empty data
@@ -393,6 +416,7 @@ async function loginFreshViaBrowser(email: string, hashedPassword: string): Prom
  * Login via plain fetch — fallback for when Playwright is not available (test mode).
  */
 async function loginFreshViaFetch(email: string, hashedPassword: string): Promise<AuthState | null> {
+  const { controller, cleanup } = createAuthFetchTimeout();
   try {
     const response = await fetch('https://chat.qwen.ai/api/v2/auths/signin', {
       method: 'POST',
@@ -404,6 +428,7 @@ async function loginFreshViaFetch(email: string, hashedPassword: string): Promis
         'x-request-id': crypto.randomUUID(),
       },
       body: JSON.stringify({ email, password: hashedPassword, login_type: 'email' }),
+      signal: controller.signal,
     });
 
     if (response.ok) {
@@ -447,6 +472,8 @@ async function loginFreshViaFetch(email: string, hashedPassword: string): Promis
     }
   } catch (err: any) {
     console.error(`[Auth] Login error for ${email}: ${err.message}`);
+  } finally {
+    cleanup();
   }
 
   return null;

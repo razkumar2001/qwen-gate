@@ -713,6 +713,9 @@ export async function chatCompletions(c: Context) {
           clearInterval(heartbeatInterval);
         }
       }, 15000); // Every 15 seconds
+      if (heartbeatInterval && typeof heartbeatInterval.unref === 'function') {
+        heartbeatInterval.unref();
+      }
 
       const writeEvent = async (data: any) => {
         await streamWriter.write(`data: ${JSON.stringify(data)}\n\n`);
