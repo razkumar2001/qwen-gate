@@ -96,12 +96,14 @@ const MAX_SYSTEM_ENTRIES = 500;
 
 class LogStore {
   private entries: LogEntry[] = [];
+  private entryMap: Map<string, LogEntry> = new Map();
   private systemEntries: SystemLogEntry[] = [];
   private listeners: Set<(entry: LogEntry) => void> = new Set();
   private systemListeners: Set<(entry: SystemLogEntry) => void> = new Set();
   private persistencePath: string | null = null;
   private requestLogPath: string | null = null;
   private systemIdCounter = 0;
+
 
   enablePersistence(dirPath: string): void {
     try {
@@ -245,15 +247,18 @@ class LogStore {
       errors: [],
     };
     this.entries.unshift(entry);
-    if (this.entries.length > MAX_ENTRIES) this.entries.pop();
+    this.entryMap.set(entry.id, entry);
+    if (this.entries.length > MAX_ENTRIES) {
+      const removed = this.entries.pop();
+      if (removed) this.entryMap.delete(removed.id);
+    }
     return entry;
   }
 
   updateEntry(id: string, updater: (entry: LogEntry) => void): void {
-    const entry = this.entries.find(e => e.id === id);
+    const entry = this.entryMap.get(id);
     if (!entry) return;
     updater(entry);
-    // Notify SSE listeners
     for (const listener of this.listeners) {
       listener(entry);
     }
@@ -283,6 +288,10 @@ class LogStore {
     this.updateEntry(id, entry => {
       entry.processedApiOutput += content;
     });
+  }
+
+  getEntry(id: string): LogEntry | undefined {
+    return this.entryMap.get(id);
   }
 
   addError(id: string, error: string): void {
