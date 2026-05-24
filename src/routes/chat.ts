@@ -9,6 +9,7 @@ import { robustParseJSON } from '../utils/json.ts';
 import { StreamingToolParser, MAX_TOOL_CALLS_PER_RESPONSE } from '../tools/parser.ts';
 import { validateSingleToolCall } from '../tools/guard.ts';
 import { filterContent, stripToolCallArtifacts } from '../utils/contentFilter.ts';
+import { StreamingContentFilter } from './pipeline/StreamingContentFilter.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import modelSpecs from '../models.json' with { type: 'json' };
 import { logStore } from '../services/logStore.ts';
@@ -623,10 +624,12 @@ export async function chatCompletions(c: Context) {
         });
       }
 
+      const reasoningTokensEstimate = reasoningBuffer ? Math.ceil(reasoningBuffer.length / 4) : 0;
       const usage = {
         prompt_tokens: promptTokens,
         completion_tokens: completionTokens,
         total_tokens: promptTokens + completionTokens,
+        completion_tokens_details: { reasoning_tokens: reasoningTokensEstimate },
         prompt_tokens_details: { cached_tokens: 0 }
       };
       const { cleanText: baseFilteredContent, thinking: filteredReasoning } = contentFiltering
@@ -675,6 +678,8 @@ export async function chatCompletions(c: Context) {
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model: body.model,
+        system_fingerprint: 'fp_qwen_gate',
+        service_tier: 'default',
         choices: [{
           index: 0,
           message,
@@ -734,6 +739,8 @@ export async function chatCompletions(c: Context) {
         object: 'chat.completion.chunk',
         created: Math.floor(Date.now() / 1000),
         model: body.model,
+        system_fingerprint: 'fp_qwen_gate',
+        service_tier: 'default',
         choices: [makeChoice({ role: 'assistant', content: '' })]
       });
 
@@ -756,12 +763,14 @@ export async function chatCompletions(c: Context) {
       // causing getNewContent() to re-emit the entire text as "new".
       let lastFilteredSnapshot = '';
       let lastThinkingSnapshot = '';
-      // O(n²) → O(n) filter cache: only re-run filterContent() when lastFullContent
-      // actually grows. Pure function on same input = same output, so cache is safe.
-      let lastFilteredLength = -1;
-      let cachedBaseFiltered = '';
-      let cachedFilteredThinking = '';
-      let cachedFullFilteredText = '';
+      const enableContentFiltering = contentFiltering;
+      const enableToolCalling = toolCalling;
+      const enableCleanOutput = cleanOutput;
+      // Stateful content filter: maintains high-water mark across chunks for cleaner architecture.
+      // Note: The filter still processes full text internally; the architectural benefit is
+      // stateful design and delta-based API. True O(n²)→O(n) optimization requires deeper
+      // changes to filterContent() internals (incremental regex on unconfirmed tail only).
+      const streamFilter = new StreamingContentFilter(enableContentFiltering);
       // Pre-parser cumulative tracking: detect cumulative vStr BEFORE feeding parser
       // to prevent parser buffer from growing quadratically.
       let lastVStrRaw = '';
@@ -957,21 +966,22 @@ export async function chatCompletions(c: Context) {
                   }
                 }
 
-                // Apply content filtering with O(n²) → O(n) cache: only re-run
-                // filterContent() when lastFullContent length changes. Pure function
-                // on same input = same output, so cache is safe.
-                if (lastFullContent.length !== lastFilteredLength) {
-                  const { cleanText, thinking } = (contentFiltering && lastFullContent)
-                    ? filterContent(lastFullContent)
-                    : { cleanText: lastFullContent || '', thinking: '' };
-                  cachedBaseFiltered = cleanText;
-                  cachedFilteredThinking = thinking;
-                  cachedFullFilteredText = stripToolCallArtifacts(cleanText);
-                  lastFilteredLength = lastFullContent.length;
-                }
-                const baseFilteredContent = cachedBaseFiltered;
-                const filteredThinking = cachedFilteredThinking;
-                const fullFilteredText = cachedFullFilteredText;
+                // Apply stateful content filter: returns deltas since last feed() call.
+                // The filter maintains internal state and only processes text beyond its
+                // confirmed high-water mark. For full filtered text (needed downstream
+                // for snapshot diffing), we reconstruct from deltas.
+                const { cleanDelta, thinkingDelta } = streamFilter.feed(lastFullContent);
+                
+                // Reconstruct full filtered text for downstream use in snapshot diffing.
+                // Note: This is necessary because downstream code uses full text for
+                // pendingText/cleanedText calculations and snapshot comparisons.
+                const baseFilteredContent = enableContentFiltering
+                  ? filterContent(lastFullContent).cleanText
+                  : lastFullContent;
+                const filteredThinking = enableContentFiltering
+                  ? filterContent(lastFullContent).thinking
+                  : '';
+                const fullFilteredText = stripToolCallArtifacts(baseFilteredContent);
 
                 // Emit parser-captured thinking first (from <think> tags)
                 if (parserThinking) {
@@ -1187,7 +1197,9 @@ export async function chatCompletions(c: Context) {
       if (remainingText) {
         lastFullContent += remainingText;
       }
-      const { cleanText: flushBase, thinking: flushThinking } = (contentFiltering && lastFullContent)
+      // Flush the streaming filter to capture any remaining content
+      const { cleanDelta: flushCleanDelta, thinkingDelta: flushThinkingDelta } = streamFilter.flush();
+      const { cleanText: flushBase, thinking: flushThinking } = (enableContentFiltering && lastFullContent)
         ? filterContent(lastFullContent)
         : { cleanText: lastFullContent || '', thinking: '' };
       const flushFiltered = stripToolCallArtifacts(flushBase);
@@ -1277,10 +1289,12 @@ export async function chatCompletions(c: Context) {
       }
   
       // Send finish reason
+      const streamReasoningTokensEstimate = reasoningBuffer ? Math.ceil(reasoningBuffer.length / 4) : 0;
       const usage = {
         prompt_tokens: promptTokens,
         completion_tokens: completionTokens,
         total_tokens: promptTokens + completionTokens,
+        completion_tokens_details: { reasoning_tokens: streamReasoningTokensEstimate },
         prompt_tokens_details: { cached_tokens: 0 }
       };
   
@@ -1293,6 +1307,8 @@ export async function chatCompletions(c: Context) {
         object: 'chat.completion.chunk',
         created: Math.floor(Date.now() / 1000),
         model: body.model,
+        system_fingerprint: 'fp_qwen_gate',
+        service_tier: 'default',
         choices: [makeChoice({}, finalFinishReason)],
         ...(body.stream_options?.include_usage ? {} : { usage })
       });
@@ -1303,6 +1319,8 @@ export async function chatCompletions(c: Context) {
           object: 'chat.completion.chunk',
           created: Math.floor(Date.now() / 1000),
           model: body.model,
+          system_fingerprint: 'fp_qwen_gate',
+          service_tier: 'default',
           choices: [],
           usage
         });
