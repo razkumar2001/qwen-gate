@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import path from 'path';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'fs';
-import { activePage } from './playwright.ts';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, watch, type FSWatcher } from 'fs';
+import { getActivePage, getBrowser, createAccountContext } from './playwright.ts';
 
 const AUTH_FETCH_TIMEOUT_MS = parseInt(process.env.QWEN_FETCH_TIMEOUT_MS || '30000', 10);
 
@@ -51,8 +51,9 @@ class LoginMutex {
  */
 async function checkPlaywrightSession(): Promise<boolean> {
   try {
-    if (!activePage) return false;
-    const cookies = await activePage.context().cookies();
+    const page = getActivePage();
+    if (!page) return false;
+    const cookies = await page.context().cookies();
     return cookies.some(c =>
       c.name.toLowerCase().includes('token') ||
       c.name.toLowerCase().includes('session')
@@ -76,6 +77,10 @@ export interface AccountEntry {
   throttledUntil: number;
   refreshInFlight: Promise<boolean> | null;
   loginAttempt: number;
+  /** Number of currently in-flight chat requests using this account */
+  inFlight: number;
+  /** Total chat requests processed by this account since startup */
+  totalRequests: number;
 }
 
 const AUTH_TOKEN_MAX_AGE_MS = parseInt(process.env.AUTH_TOKEN_MAX_AGE_MS || String(60 * 60 * 1000), 10);
@@ -86,22 +91,54 @@ let accounts: AccountEntry[] = [];
 let roundRobinIndex = 0;
 let initDone = false;
 
+function parseAccountsFromEnv(): Array<{ email: string; password: string }> {
+  const result: Array<{ email: string; password: string }> = [];
+  // Read ACCOUNT1, ACCOUNT2, ... ACCOUNTn from env
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!/^ACCOUNT\d+$/i.test(key) || !value) continue;
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    const colonIdx = trimmed.indexOf(':');
+    if (colonIdx <= 0) continue;
+    const email = trimmed.substring(0, colonIdx).trim();
+    const password = trimmed.substring(colonIdx + 1).trim();
+    if (email && password) {
+      result.push({ email, password });
+    }
+  }
+  return result;
+}
+
 function discoverSavedAccounts(): Array<{ email: string; password: string }> {
   try {
-    if (!existsSync(COOKIE_DIR)) return [];
-    const files = readdirSync(COOKIE_DIR).filter((f: string) => f.endsWith('.json'));
-    const accounts: Array<{ email: string; password: string }> = [];
-    for (const file of files) {
-      try {
-        const data: SavedAccountData = JSON.parse(readFileSync(path.join(COOKIE_DIR, file), 'utf-8'));
-        if (data.email && data.token) {
-          accounts.push({ email: data.email, password: '' });
+    const diskAccounts: Array<{ email: string; password: string }> = [];
+    if (existsSync(COOKIE_DIR)) {
+      const files = readdirSync(COOKIE_DIR).filter((f: string) => f.endsWith('.json'));
+      for (const file of files) {
+        try {
+          const data: SavedAccountData = JSON.parse(readFileSync(path.join(COOKIE_DIR, file), 'utf-8'));
+          if (data.email && data.token) {
+            diskAccounts.push({ email: data.email, password: '' });
+          }
+        } catch (err) {
+          console.error(`[Auth] Failed to parse saved account file ${file}:`, err);
         }
-      } catch (err) {
-        console.error(`[Auth] Failed to parse saved account file ${file}:`, err);
       }
     }
-    return accounts;
+
+    // Merge env accounts: update passwords for existing, add new ones
+    const envAccounts = parseAccountsFromEnv();
+    const merged = [...diskAccounts];
+    for (const envAcct of envAccounts) {
+      const existing = merged.find(a => a.email.toLowerCase().trim() === envAcct.email.toLowerCase().trim());
+      if (existing) {
+        existing.password = envAcct.password;
+      } else {
+        merged.push({ email: envAcct.email, password: envAcct.password });
+      }
+    }
+
+    return merged;
   } catch {
     return [];
   }
@@ -121,8 +158,13 @@ function needsRefresh(acct: AccountEntry): boolean {
 }
 
 /**
- * Pick the best available account: round-robin among non-throttled accounts,
- * preferring the least recently used. Returns null if all are throttled.
+ * Pick the best available account:
+ *   1. Consider only available (non-throttled, authenticated) accounts
+ *   2. Prefer idle accounts (no in-flight requests)
+ *   3. Among idle (or all if all busy), pick the one with the lowest total request count
+ *   4. If all are throttled, pick the one with the shortest remaining cooldown
+ *
+ * This distributes load evenly across all accounts over time.
  */
 export function pickAccount(): AccountEntry | null {
   const available = accounts.filter(isAvailable);
@@ -139,13 +181,50 @@ export function pickAccount(): AccountEntry | null {
     return best;
   }
 
-  // Sort by lastUsed ascending (least recently used first), then round-robin
-  available.sort((a, b) => a.lastUsed - b.lastUsed);
-  
-  // Pick from available using round-robin index
-  const idx = roundRobinIndex % available.length;
-  roundRobinIndex = (roundRobinIndex + 1) % Math.max(available.length, 1);
-  return available[idx];
+  // Prefer idle accounts (no in-flight requests); if all are busy, use all available
+  const idle = available.filter(a => a.inFlight === 0);
+  const candidates = idle.length > 0 ? idle : available;
+
+  // Pick the one with the fewest total requests — equalizes distribution over time
+  candidates.sort((a, b) => a.totalRequests - b.totalRequests);
+  return candidates[0];
+}
+
+// ─── In-Flight & Request Tracking ───────────────────────────────────────────────
+
+/**
+ * Mark an account as having an in-flight request.
+ * Called from SessionPool.acquire() before async ops begin.
+ */
+export function incrementInFlight(email: string): void {
+  const acct = getAccountByEmail(email);
+  if (acct) acct.inFlight++;
+}
+
+/**
+ * Mark an account's in-flight request as completed.
+ * Called from SessionPool.release().
+ */
+export function decrementInFlight(email: string): void {
+  const acct = getAccountByEmail(email);
+  if (acct && acct.inFlight > 0) acct.inFlight--;
+}
+
+/**
+ * Increment the total request count for an account.
+ * Called from SessionPool.release() after a request completes.
+ */
+export function incrementTotalRequests(email: string): void {
+  const acct = getAccountByEmail(email);
+  if (acct) acct.totalRequests++;
+}
+
+/**
+ * Helper to check if an account has in-flight requests.
+ */
+export function hasInFlight(email: string): boolean {
+  const acct = getAccountByEmail(email);
+  return acct ? acct.inFlight > 0 : false;
 }
 
 /**
@@ -232,7 +311,12 @@ async function tryRefreshToken(acct: AccountEntry): Promise<boolean> {
           expiresAt: Date.now() + AUTH_TOKEN_MAX_AGE_MS,
           refreshToken: data.data.refresh_token || acct.state.refreshToken,
         };
-        console.log(`[Auth] Token refreshed for ${acct.email}`);
+        if (acct.throttledUntil > Date.now()) {
+          console.log(`[Auth] ✓ Token refreshed for ${acct.email} — clearing throttle`);
+          acct.throttledUntil = 0;
+        } else {
+          console.log(`[Auth] ✓ Token refreshed for ${acct.email}`);
+        }
         return true;
       }
     }
@@ -254,14 +338,19 @@ async function ensureAccountFresh(acct: AccountEntry): Promise<boolean> {
 
   acct.refreshInFlight = (async () => {
     try {
-      // Try refresh token first
       if (acct.state?.refreshToken) {
         console.log(`[Auth] Refreshing token for ${acct.email}...`);
         if (await tryRefreshToken(acct)) return true;
-        console.warn(`[Auth] Refresh failed for ${acct.email}, re-logging in...`);
+        console.warn(`[Auth] Refresh token failed for ${acct.email}`);
       }
 
-      // Fresh login
+      if (acct.throttledUntil > Date.now()) {
+        const waitSec = Math.ceil((acct.throttledUntil - Date.now()) / 1000);
+        console.warn(`[Auth] ⏳ Skipping re-login for ${acct.email} — throttled for ${waitSec}s more`);
+        return false;
+      }
+
+      console.log(`[Auth] Attempting fresh login for ${acct.email}...`);
       const newState = await loginFresh(acct.email, acct.password);
       if (newState) {
         acct.state = newState;
@@ -289,13 +378,14 @@ const loginMutex = new LoginMutex();
 async function loginFreshViaBrowser(email: string, hashedPassword: string): Promise<AuthState | null> {
   const release = await loginMutex.acquire();
   try {
-    if (!activePage) return null;
+    const page = getActivePage();
+    if (!page) return null;
 
     // Ensure page is on the right origin for proper CORS/cookie handling
     try {
-      const currentUrl = activePage.url();
+      const currentUrl = page.url();
       if (!currentUrl.startsWith('https://chat.qwen.ai')) {
-        await activePage.goto('https://chat.qwen.ai', { waitUntil: 'domcontentloaded' });
+        await page.goto('https://chat.qwen.ai', { waitUntil: 'domcontentloaded' });
       }
     } catch (err: any) {
       console.warn(`[Auth] Navigation check failed for ${email}: ${err.message}`);
@@ -303,7 +393,7 @@ async function loginFreshViaBrowser(email: string, hashedPassword: string): Prom
 
     // Clear existing auth cookies for a clean slate (this is global to the browser context)
     try {
-      const context = activePage.context();
+      const context = page.context();
       const existingCookies = await context.cookies();
       const authCookies = existingCookies.filter(c =>
         c.name === 'token' ||
@@ -322,7 +412,7 @@ async function loginFreshViaBrowser(email: string, hashedPassword: string): Prom
     // Execute signin API call inside the browser context
     let evalResult: { ok: boolean; status: number; token: string | null; refreshToken: string | null; dataKeys: string[] };
     try {
-      evalResult = await activePage.evaluate(async ({ email, hashedPassword }: { email: string; hashedPassword: string }) => {
+      evalResult = await page.evaluate(async ({ email, hashedPassword }: { email: string; hashedPassword: string }) => {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 30_000);
         let response: Response;
@@ -337,7 +427,7 @@ async function loginFreshViaBrowser(email: string, hashedPassword: string): Prom
               'x-request-id': crypto.randomUUID(),
             },
             credentials: 'include',
-            body: JSON.stringify({ email, password: hashedPassword, login_type: 'email' }),
+            body: JSON.stringify({ email, password: hashedPassword }),
             signal: controller.signal,
           });
         } finally {
@@ -372,7 +462,7 @@ async function loginFreshViaBrowser(email: string, hashedPassword: string): Prom
     let cookieToken: string | null = null;
     let cookieRefresh: string | null = null;
     try {
-      const cookies = await activePage.context().cookies();
+      const cookies = await page.context().cookies();
       const tokenCookie = cookies.find(c =>
         c.name === 'token' ||
         (c.name.toLowerCase().includes('token') && c.domain.includes('qwen') && !c.name.toLowerCase().includes('refresh'))
@@ -424,10 +514,14 @@ async function loginFreshViaFetch(email: string, hashedPassword: string): Promis
         'accept': 'application/json, text/plain, */*',
         'content-type': 'application/json',
         'source': 'web',
+        'Version': '0.2.57',
+        'bx-v': '2.5.36',
+        'Referer': 'https://chat.qwen.ai/auth',
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
         'timezone': Intl.DateTimeFormat().resolvedOptions().timeZone,
         'x-request-id': crypto.randomUUID(),
       },
-      body: JSON.stringify({ email, password: hashedPassword, login_type: 'email' }),
+      body: JSON.stringify({ email, password: hashedPassword }),
       signal: controller.signal,
     });
 
@@ -439,9 +533,16 @@ async function loginFreshViaFetch(email: string, hashedPassword: string): Promis
       let refreshToken = data.data?.refresh_token || data.refresh_token || null;
 
       if (!token) {
-        const setCookie = response.headers.get('set-cookie') || '';
-        const match = setCookie.match(/token=([^;]+)/);
-        if (match) token = match[1];
+        const setCookies: string[] = typeof (response.headers as any).getSetCookie === 'function'
+          ? (response.headers as any).getSetCookie()
+          : (response.headers.get('set-cookie') || '').split(',');
+
+        for (const cookie of setCookies) {
+          const tokenMatch = cookie.match(/\btoken=([^;]+)/);
+          if (tokenMatch && !token) token = tokenMatch[1];
+          const refreshMatch = cookie.match(/\brefresh_token=([^;]+)/);
+          if (refreshMatch) refreshToken = refreshMatch[1];
+        }
       }
 
       if (token) {
@@ -472,11 +573,92 @@ async function loginFreshViaFetch(email: string, hashedPassword: string): Promis
     }
   } catch (err: any) {
     console.error(`[Auth] Login error for ${email}: ${err.message}`);
-  } finally {
-    cleanup();
   }
 
   return null;
+}
+
+async function loginViaTempContext(
+  _browser: ReturnType<typeof getBrowser>,
+  email: string,
+  rawPassword: string,
+): Promise<AuthState | null> {
+  const release = await loginMutex.acquire();
+  try {
+    const accCtx = await createAccountContext(email);
+    const page = accCtx.page;
+    const context = accCtx.context;
+
+    let capturedToken: string | null = null;
+    let capturedRefresh: string | null = null;
+
+    await page.route('**/api/v2/auths/signin', async (route) => {
+      const response = await route.fetch();
+      const setCookies = response.headersArray()
+        .filter(h => h.name.toLowerCase() === 'set-cookie')
+        .map(h => h.value);
+      for (const cookie of setCookies) {
+        const tokenMatch = cookie.match(/\btoken=([^;]+)/);
+        if (tokenMatch && !capturedToken) capturedToken = tokenMatch[1];
+        const refreshMatch = cookie.match(/\brefresh_token=([^;]+)/);
+        if (refreshMatch) capturedRefresh = refreshMatch[1];
+      }
+      await route.fulfill({ response });
+    });
+
+    try {
+      await page.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    } catch {}
+
+    try {
+      await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 15_000 });
+      await page.fill('input[type="email"], input[name="email"]', email);
+      await page.fill('input[type="password"], input[name="password"]', rawPassword);
+      await Promise.all([
+        page.click('button[type="submit"], button:has-text("Sign in"), button:has-text("Log in")'),
+        page.waitForURL(url => !url.toString().includes('/auth'), { timeout: 15_000 }).catch(() => {}),
+      ]);
+    } catch {}
+
+    await new Promise(r => setTimeout(r, 2000));
+
+    if (!capturedToken) {
+      const cookies = await context.cookies();
+      const tokenCookie = cookies.find(c =>
+        c.name === 'token' ||
+        (c.name.toLowerCase().includes('token') && c.domain.includes('qwen') && !c.name.toLowerCase().includes('refresh'))
+      );
+      const refreshCookie = cookies.find(c =>
+        c.name === 'refresh_token' ||
+        (c.name.toLowerCase().includes('refresh') && c.domain.includes('qwen'))
+      );
+      capturedToken = tokenCookie?.value || null;
+      capturedRefresh = refreshCookie?.value || null;
+    }
+
+    await page.unroute('**/api/v2/auths/signin');
+
+    if (capturedToken) {
+      const state: AuthState = {
+        token: capturedToken,
+        expiresAt: Date.now() + AUTH_TOKEN_MAX_AGE_MS,
+        refreshToken: capturedRefresh,
+      };
+      console.log(`[Auth] Login successful for ${email} (temp context)`);
+      return state;
+    }
+
+    const cookies = await context.cookies();
+    console.warn(
+      `[Auth] Temp context login failed for ${email}. Cookies: ${cookies.map(c => c.name).join(', ')}`
+    );
+    return null;
+  } catch (err: any) {
+    console.error(`[Auth] Temp context login error for ${email}: ${err.message}`);
+    return null;
+  } finally {
+    release();
+  }
 }
 
 /**
@@ -487,15 +669,25 @@ async function loginFresh(email: string, password: string): Promise<AuthState | 
   const hashedPassword = crypto.createHash('sha256').update(password).digest('hex');
   console.log(`[Auth] Logging in as ${email}...`);
 
-  // Browser path: use activePage.evaluate() for proper WAF headers + cookie capture
-  if (activePage && !process.env.TEST_MOCK_PLAYWRIGHT) {
-    const browserResult = await loginFreshViaBrowser(email, hashedPassword);
-    if (browserResult) return browserResult;
-    // If browser login failed (e.g., page crashed), fall through to fetch
-    console.warn(`[Auth] Browser login failed for ${email}, trying fetch fallback...`);
+  // Browser path: use getActivePage().evaluate() for proper WAF headers + cookie capture
+  if (!process.env.TEST_MOCK_PLAYWRIGHT) {
+    const activePage = getActivePage();
+    if (activePage) {
+      const browserResult = await loginFreshViaBrowser(email, hashedPassword);
+      if (browserResult) return browserResult;
+      console.warn(`[Auth] Browser login failed for ${email}, trying temp context...`);
+    }
+
+    // No active page at startup — create temporary browser context for login
+    const browser = getBrowser();
+    if (browser) {
+      const tempResult = await loginViaTempContext(browser, email, password);
+      if (tempResult) return tempResult;
+      console.warn(`[Auth] Temp context login failed for ${email}, trying fetch fallback...`);
+    }
   }
 
-  // Fetch fallback: for test mode or when browser path fails
+  // Fetch fallback: for test mode or when all browser paths fail
   return loginFreshViaFetch(email, hashedPassword);
 }
 
@@ -521,6 +713,8 @@ export async function initAuth(): Promise<void> {
     throttledUntil: 0,
     refreshInFlight: null,
     loginAttempt: 0,
+    inFlight: 0,
+    totalRequests: 0,
   }));
 
   // Login all accounts sequentially with delays between them.
@@ -530,16 +724,23 @@ export async function initAuth(): Promise<void> {
   for (let i = 0; i < accounts.length; i++) {
     const acct = accounts[i];
 
-    // First try: load saved token from manual npm run login
     const savedState = await loadSavedCookies(acct.email);
     if (savedState) {
       acct.state = savedState;
       console.log(`[Auth] ✓ ${acct.email}`);
+    } else if (acct.password) {
+      const newState = await loginFresh(acct.email, acct.password);
+      if (newState) {
+        acct.state = newState;
+        await saveCookies(acct.email, newState.token, newState.refreshToken, newState.expiresAt);
+        console.log(`[Auth] Auto-login: ${acct.email} ✓`);
+      } else {
+        console.log(`[Auth] Auto-login: ${acct.email} ✗`);
+      }
     }
 
-    // Delay between accounts to avoid rate limiting (skip after last)
     if (i < accounts.length - 1) {
-      await new Promise(r => setTimeout(r, 1000));
+      await new Promise(r => setTimeout(r, acct.password && !acct.state ? 2000 : 1000));
     }
   }
 
@@ -550,6 +751,26 @@ export async function initAuth(): Promise<void> {
   for (const acct of accounts) {
     const status = acct.state?.token ? '✓' : '✗';
     console.log(`[Auth]   ${status} ${acct.email}`);
+  }
+
+  setupAccountWatcher();
+}
+
+export async function autoLoginAllAccounts(): Promise<void> {
+  for (let i = 0; i < accounts.length; i++) {
+    const acct = accounts[i];
+    if (acct.state || !acct.password) continue;
+    const newState = await loginFresh(acct.email, acct.password);
+    if (newState) {
+      acct.state = newState;
+      await saveCookies(acct.email, newState.token, newState.refreshToken, newState.expiresAt);
+      console.log(`[Auth] Auto-login: ${acct.email} ✓`);
+    } else {
+      console.log(`[Auth] Auto-login: ${acct.email} ✗`);
+    }
+    if (i < accounts.length - 1) {
+      await new Promise(r => setTimeout(r, 2000));
+    }
   }
 }
 
@@ -571,6 +792,8 @@ export function getAccountStats(): Array<{
   throttledRemainingMs: number;
   tokenExpiresInMs: number;
   lastUsedAgoMs: number;
+  inFlight: number;
+  totalRequests: number;
 }> {
   const now = Date.now();
   return accounts.map(a => ({
@@ -580,6 +803,8 @@ export function getAccountStats(): Array<{
     throttledRemainingMs: Math.max(0, a.throttledUntil - now),
     tokenExpiresInMs: a.state ? Math.max(0, a.state.expiresAt - now) : 0,
     lastUsedAgoMs: a.lastUsed ? now - a.lastUsed : -1,
+    inFlight: a.inFlight,
+    totalRequests: a.totalRequests,
   }));
 }
 
@@ -613,8 +838,25 @@ interface SavedAccountData {
 }
 
 /**
+ * Decode a JWT token and return its payload, or null if invalid.
+ */
+function decodeJwt(token: string): Record<string, any> | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    // JWT base64url → standard base64
+    const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const json = Buffer.from(base64, 'base64').toString('utf-8');
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Load saved token for an account from disk. Called by initAuth.
  * Returns AuthState if a valid, non-expired token was found, null otherwise.
+ * Checks both the local expiresAt timestamp AND the JWT's embedded `exp` claim.
  */
 export async function loadSavedCookies(email: string): Promise<AuthState | null> {
   try {
@@ -626,12 +868,19 @@ export async function loadSavedCookies(email: string): Promise<AuthState | null>
 
     if (!data.token || data.email.toLowerCase() !== email.toLowerCase()) return null;
 
-    if (data.expiresAt < Date.now()) {
-      console.log(`[Auth] Saved token for ${email} expired, will try refresh/login`);
+    // JWT's embedded `exp` claim is authoritative — check it first
+    const payload = decodeJwt(data.token);
+    if (payload?.exp && payload.exp * 1000 < Date.now()) {
+      console.log(`[Auth] JWT for ${email} expired at ${new Date(payload.exp * 1000).toISOString()}, will try refresh/login`);
       return null;
     }
 
-    console.log(`[Auth] Loaded saved token for ${email} (expires in ${Math.round((data.expiresAt - Date.now()) / 60000)}min)`);
+    // Local expiresAt is a secondary check (may be shorter than real JWT lifetime)
+    if (data.expiresAt < Date.now()) {
+      console.log(`[Auth] Saved token for ${email} locally expired but JWT is still valid, accepting`);
+    }
+
+    console.log(`[Auth] Loaded saved token for ${email} (expires in ${Math.round((payload?.exp ? (payload.exp * 1000 - Date.now()) : (data.expiresAt - Date.now())) / 60000)}min)`);
     return {
       token: data.token,
       expiresAt: data.expiresAt,
@@ -650,12 +899,23 @@ export async function saveCookies(email: string, token: string, refreshToken?: s
   try {
     if (!existsSync(COOKIE_DIR)) mkdirSync(COOKIE_DIR, { recursive: true });
 
+    // Decode JWT to get the real embedded expiration — this is authoritative
+    let jwtExpiresAt = expiresAt;
+    if (!jwtExpiresAt) {
+      const payload = decodeJwt(token);
+      if (payload?.exp && typeof payload.exp === 'number') {
+        jwtExpiresAt = payload.exp * 1000;
+      } else {
+        jwtExpiresAt = Date.now() + AUTH_TOKEN_MAX_AGE_MS;
+      }
+    }
+
     const data: SavedAccountData = {
       email: email.toLowerCase().trim(),
       token,
       refreshToken: refreshToken || null,
       savedAt: Date.now(),
-      expiresAt: expiresAt || (Date.now() + AUTH_TOKEN_MAX_AGE_MS),
+      expiresAt: jwtExpiresAt,
     };
 
     writeFileSync(getCookieFilePath(email), JSON.stringify(data, null, 2), 'utf-8');
@@ -665,11 +925,124 @@ export async function saveCookies(email: string, token: string, refreshToken?: s
   }
 }
 
+// ─── Hot-Reload ──────────────────────────────────────────────────────────────────
+
+let accountWatcher: FSWatcher | null = null;
+let reloadDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+let watcherReady = false;
+
+/**
+ * Re-scan COOKIE_DIR and merge changes into the live accounts array.
+ * - New files → add AccountEntry with counters at 0, load saved cookies
+ * - Removed files → remove account UNLESS inFlight > 0
+ * - Existing accounts → preserve inFlight and totalRequests counters
+ */
+export async function reloadAccounts(): Promise<void> {
+  if (accountWatcher && !watcherReady) {
+    console.log('[Auth] Hot-reload: skipping (startup grace period)');
+    return;
+  }
+  const discovered = discoverSavedAccounts();
+  const discoveredEmails = new Set(discovered.map(d => d.email.toLowerCase().trim()));
+  const existingEmails = new Set(accounts.map(a => a.email.toLowerCase().trim()));
+
+  let added = 0;
+  let removed = 0;
+
+  for (const d of discovered) {
+    const email = d.email.toLowerCase().trim();
+    if (!existingEmails.has(email)) {
+      const entry: AccountEntry = {
+        email,
+        password: d.password,
+        state: null,
+        lastUsed: 0,
+        throttledUntil: 0,
+        refreshInFlight: null,
+        loginAttempt: 0,
+        inFlight: 0,
+        totalRequests: 0,
+      };
+      const savedState = await loadSavedCookies(email);
+      if (savedState) {
+        entry.state = savedState;
+      }
+      accounts.push(entry);
+      added++;
+      console.log(`[Auth] Hot-reload: added ${email}`);
+    }
+  }
+
+  for (let i = accounts.length - 1; i >= 0; i--) {
+    const acct = accounts[i];
+    if (!discoveredEmails.has(acct.email.toLowerCase().trim())) {
+      const cookieFile = getCookieFilePath(acct.email);
+      if (existsSync(cookieFile)) {
+        console.log(`[Auth] Hot-reload: keeping ${acct.email} (file exists but may be mid-write)`);
+        continue;
+      }
+      if (acct.inFlight > 0) {
+        console.log(`[Auth] Hot-reload: skipping removal of ${acct.email} (inFlight=${acct.inFlight})`);
+        continue;
+      }
+      accounts.splice(i, 1);
+      removed++;
+      console.log(`[Auth] Hot-reload: removed ${acct.email}`);
+    }
+  }
+
+  const unchanged = accounts.length - added;
+  console.log(`[Auth] Hot-reload: +${added} new, -${removed} removed, ${unchanged} unchanged`);
+}
+
+/**
+ * Set up fs.watch on COOKIE_DIR with 300ms debounce to detect account file changes.
+ */
+export function setupAccountWatcher(): void {
+  if (accountWatcher) return;
+
+  if (!existsSync(COOKIE_DIR)) {
+    mkdirSync(COOKIE_DIR, { recursive: true });
+  }
+
+  try {
+    accountWatcher = watch(COOKIE_DIR, (_eventType, filename) => {
+      if (!filename || !filename.endsWith('.json')) return;
+
+      if (reloadDebounceTimer) clearTimeout(reloadDebounceTimer);
+      reloadDebounceTimer = setTimeout(() => {
+        reloadDebounceTimer = null;
+        reloadAccounts().catch(err => {
+          console.error(`[Auth] Hot-reload failed: ${err.message}`);
+        });
+      }, 500);
+    });
+
+    accountWatcher.on('error', (err) => {
+      console.error(`[Auth] Account watcher error: ${err.message}`);
+    });
+
+    console.log(`[Auth] Watching ${COOKIE_DIR} for account changes`);
+    setTimeout(() => { watcherReady = true; }, 2000);
+  } catch (err: any) {
+    console.error(`[Auth] Failed to set up account watcher: ${err.message}`);
+  }
+}
+
+/**
+ * Enable hot-reload by starting the account file watcher.
+ * Called automatically at end of initAuth(), or manually via admin endpoint.
+ */
+export function enableHotReload(): void {
+  setupAccountWatcher();
+}
+
 // ─── Backward Compatibility ─────────────────────────────────────────────────────
 
 export function clearAuth(): void {
   accounts = [];
   initDone = false;
+  watcherReady = false;
 }
 
 export async function ensureAuthenticated(): Promise<boolean> {

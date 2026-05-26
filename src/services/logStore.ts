@@ -45,48 +45,32 @@ export interface LogEntry {
   timestamp: string;
   model: string;
   stream: boolean;
-  // Client -> Proxy
-  clientRequest: {
-    messageCount: number;
-    roles: string[];
-    hasTools: boolean;
-    toolNames: string[];
-    tool_choice: string | null;
-    lastMessage: string;
-  };
-  // Proxy -> Qwen
-  promptToQwen: {
-    systemPromptLength: number;
-    totalLength: number;
-    preview: string;
-  };
-  // Qwen -> Proxy (ALL raw chunks, before any filtering)
-  qwenRawChunks: string[];
-  // Full raw output (all chunks joined, before processing)
-  rawFullContent: string;
-  // Proxy -> Qwen tool results (if any)
-  toolCallResults: Array<{ name: string; isError: boolean; result: string }>;
-  // Parser
-  parsedToolCalls: Array<{ name: string; args: string }>;
-  remainingText: string;
-  // Proxy -> Client (what the client actually receives after all processing)
-  processedApiOutput: string;
-  finalResponse: {
-    finishReason: string;
-    toolCallCount: number;
-    contentPreview: string;
-  };
-  // Errors
-  errors: string[];
-  // Amplification monitoring
-  amplificationRatio?: number;
-  amplificationTriggeredInput?: string;
+  accountEmail: string;
+  level: LogLevel;
+  request_id: string;
+  latency_ms: number | null;
+  tokens: { prompt: number; completion: number; total: number } | null;
+  input: string; // Sanitized prompt for display
+  rawRequestBody?: Record<string, unknown>; // Full OpenAI request body (model, messages, tools, etc.)
+  rawResponse: string; // Full raw response from Qwen (not truncated)
+  processedResponse: string; // After content filtering/tool parsing
+  error: string | null;
+  toolCalls: Array<{
+    name: string;
+    arguments: Record<string, unknown>;
+    result?: unknown;
+    success: boolean;
+    blocked?: boolean;
+    blockReason?: string;
+    error?: string;
+    executionTimeMs?: number;
+  }>;
   networkTiming?: {
-    ttfb: number | null;           // ms
-    totalDuration: number | null;  // ms
-    chunksReceived: number;
-    chunksPerSecond: number | null;
-    debugEntryId: string;          // link to full network debug entry
+    dnsLookup: number;
+    tcpConnect: number;
+    tlsHandshake: number;
+    firstByte: number;
+    total: number;
   };
 }
 
@@ -214,12 +198,18 @@ class LogStore {
     return () => { this.systemListeners.delete(listener); };
   }
 
-  createEntry(id: string, model: string, stream: boolean): LogEntry {
+  createEntry(id: string, model: string, stream: boolean, requestId?: string, accountEmail?: string): LogEntry {
     const entry: LogEntry = {
       id,
       timestamp: new Date().toISOString(),
       model,
       stream,
+      accountEmail: accountEmail || '',
+      // Structured log fields for external aggregators
+      level: 'info',
+      request_id: requestId ?? id,
+      latency_ms: null,
+      tokens: null,
       clientRequest: {
         messageCount: 0,
         roles: [],
@@ -318,6 +308,129 @@ class LogStore {
   subscribe(listener: (entry: LogEntry) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  // Uptime in seconds since server start
+  getUptimeSeconds(): number {
+    return Math.floor((Date.now() - this.serverStartTime) / 1000);
+  }
+
+  // ─── Model Health Tracking ──────────────────────────────────────────────────
+
+  private modelErrorCounts: Map<string, number> = new Map();
+  private modelSuccessCounts: Map<string, number> = new Map();
+  private readonly MODEL_HEALTH_WINDOW_MS = 5 * 60 * 1000; // 5 minute sliding window
+  private modelHealthTimestamps: Map<string, number> = new Map();
+
+  /**
+   * Record an error for a specific model - used by ModelRouter for health tracking
+   */
+  recordModelError(model: string): void {
+    const count = this.modelErrorCounts.get(model) || 0;
+    this.modelErrorCounts.set(model, count + 1);
+    this.modelHealthTimestamps.set(model, Date.now());
+  }
+
+  /**
+   * Record a success for a specific model - used by ModelRouter for health tracking
+   */
+  recordModelSuccess(model: string): void {
+    const count = this.modelSuccessCounts.get(model) || 0;
+    this.modelSuccessCounts.set(model, count + 1);
+    this.modelHealthTimestamps.set(model, Date.now());
+  }
+
+  /**
+   * Get health metrics for a model within the sliding window
+   */
+  getModelHealth(model: string): { errors: number; successes: number; errorRate: number; isHealthy: boolean } {
+    const now = Date.now();
+    const lastCheck = this.modelHealthTimestamps.get(model);
+    
+    // Expire metrics outside the health window
+    if (lastCheck && now - lastCheck > this.MODEL_HEALTH_WINDOW_MS) {
+      this.modelErrorCounts.delete(model);
+      this.modelSuccessCounts.delete(model);
+      this.modelHealthTimestamps.delete(model);
+      return { errors: 0, successes: 0, errorRate: 0, isHealthy: true };
+    }
+
+    const errors = this.modelErrorCounts.get(model) || 0;
+    const successes = this.modelSuccessCounts.get(model) || 0;
+    const total = errors + successes;
+    const errorRate = total > 0 ? errors / total : 0;
+    const errorThreshold = 0.3; // 30% error rate triggers degradation
+
+    return {
+      errors,
+      successes,
+      errorRate,
+      isHealthy: errorRate < errorThreshold
+    };
+  }
+
+  /**
+   * Reset health metrics for a model (useful for testing or manual recovery)
+   */
+  resetModelHealth(model: string): void {
+    this.modelErrorCounts.delete(model);
+    this.modelSuccessCounts.delete(model);
+    this.modelHealthTimestamps.delete(model);
+  }
+
+  getAllModelHealth(): Record<string, { successCount: number; errorCount: number; lastActivity: string }> {
+    const result: Record<string, { successCount: number; errorCount: number; lastActivity: string }> = {};
+    const allModels = new Set([...this.modelErrorCounts.keys(), ...this.modelSuccessCounts.keys()]);
+    for (const model of allModels) {
+      result[model] = {
+        successCount: this.modelSuccessCounts.get(model) || 0,
+        errorCount: this.modelErrorCounts.get(model) || 0,
+        lastActivity: this.modelHealthTimestamps.get(model) || '',
+      };
+    }
+    return result;
+  }
+
+  // ─── Tool Discipline Metrics ──────────────────────────────────────────────
+
+  private toolCallValidationFailures = 0;
+  private hallucinatedToolNames = 0;
+
+  /**
+   * Increment counter for tool call validation failures
+   * (e.g., JSON parse errors, schema mismatches, guard rejections)
+   */
+  recordToolCallValidationFailure(): void {
+    this.toolCallValidationFailures++;
+  }
+
+  /**
+   * Increment counter for hallucinated tool names
+   * (e.g., model invents tool not in available_tools registry)
+   */
+  recordHallucinatedToolName(): void {
+    this.hallucinatedToolNames++;
+  }
+
+  /**
+   * Get tool discipline metrics for observability/Prometheus export
+   */
+  getToolDisciplineMetrics(): {
+    toolCallValidationFailures: number;
+    hallucinatedToolNames: number;
+  } {
+    return {
+      toolCallValidationFailures: this.toolCallValidationFailures,
+      hallucinatedToolNames: this.hallucinatedToolNames,
+    };
+  }
+
+  /**
+   * Reset tool discipline metrics (useful for testing or manual recovery)
+   */
+  resetToolDisciplineMetrics(): void {
+    this.toolCallValidationFailures = 0;
+    this.hallucinatedToolNames = 0;
   }
 }
 

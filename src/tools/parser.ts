@@ -34,12 +34,29 @@ const TRIM_KEEP_CONTEXT = 4096;
 const MAX_BRACE_SEARCH_DISTANCE = 500;
 /**
  * Circuit breaker: maximum tool calls extracted per response.
- * If the model vomits 30+ recursive tool calls (see output-problems/07.md),
+ * If the model vomits too many recursive tool calls (see output-problems/07.md),
  * we stop extracting and treat the rest as plain text. This prevents the
  * client from being flooded with tool_call events and the model from entering
  * an infinite self-referential loop.
+ *
+ * Configurable via MAX_TOOL_CALLS_PER_RESPONSE env var (default: 10).
+ * Setting too high (>15) increases hallucination risk as the model's attention
+ * degrades with each additional tool call. Default 10 balances flexibility with safety.
  */
-export const MAX_TOOL_CALLS_PER_RESPONSE = 25;
+export const MAX_TOOL_CALLS_PER_RESPONSE = (() => {
+  const envVal = process.env.MAX_TOOL_CALLS_PER_RESPONSE;
+  if (envVal !== undefined) {
+    const parsed = parseInt(envVal, 10);
+    if (!isNaN(parsed) && parsed > 0 && Number.isFinite(parsed)) {
+      return parsed;
+    }
+    console.warn(
+      `[parser] Invalid MAX_TOOL_CALLS_PER_RESPONSE="${envVal}", ` +
+      `must be a positive integer. Falling back to default 10.`
+    );
+  }
+  return 10;
+})();
 
 export class StreamingToolParser {
   private buffer = '';

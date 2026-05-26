@@ -265,7 +265,14 @@ export function stripToolCallArtifacts(text: string): string {
   // These can appear when a tool call array gets partially rendered.
   text = text.replace(/^[\s]*[\]\}]+[\}\]\}]*\s*$/gm, '');
 
-  // ── Pass 4: Strip any remaining XML-like tool wrapper tags ─────────
+  // ── Pass 4: Strip tool-usage echo from output ───────────────────────
+  // When the model describes what tool it's calling or what a tool returned,
+  // that text is redundant — the tool_calls are already structured data and
+  // the client already has the tool results. This echo blasts the context
+  // window with information nobody needs to see twice.
+  text = stripToolEcho(text);
+
+  // ── Pass 5: Strip any remaining XML-like tool wrapper tags ─────────
   // Safety net: if the model ever outputs ,>,
   // <tool_call>, or similar XML wrappers despite instructions, strip them
   // completely (including content between matching tags).
@@ -284,6 +291,155 @@ export function stripToolCallArtifacts(text: string): string {
   text = text.replace(/\n{3,}/g, '\n\n').trim();
 
   return text;
+}
+
+/**
+ * Tool echo patterns — the model describing its own tool usage in natural language.
+ * When the model calls tools, it sometimes also writes sentences like:
+ *   "I'll use the read_file tool to read the file..."
+ *   "The bash command returned: ..."
+ *   "Based on the output of grep..."
+ * This text is redundant because tool_calls and tool results are already structured
+ * data. Stripping it prevents context window bloat.
+ *
+ * Each pattern targets a specific "echo" structure. Patterns are ordered by
+ * specificity (most specific first) to minimize false positives.
+ */
+const TOOL_ECHO_PATTERNS: RegExp[] = [
+  // "I'll use/call/run the X tool/command to..."
+  /\bI(?:'ll|\s+will|\s+shall|\s+can|\s+need\s+to)\s+(?:use|run|call|invoke|execute|try)\s+(?:the\s+)?[a-z_]+(?:\.\w+)?\s+(?:tool|command|function|utility)/gi,
+
+  // "Using the X tool to/for..."
+  /\bUsing\s+(?:the\s+)?[a-z_]+(?:\.\w+)?\s+(?:tool|command|function|utility)\s+(?:to|for|I)/gi,
+
+  // "The X tool/command returned/shows/produced/found..."
+  /\b[Tt]he\s+[a-z_]+(?:\.\w+)?\s+(?:tool|command|function|utility)\s+(?:returned|shows?|produced|found|gave|output(?:ted)?|contained|has|displays?)/gi,
+
+  // "Tool X result/output/response:" or "Tool X returned/showed:"
+  /\b[Tt]ool\s+[a-z_]+(?:\.\w+)?\s+(?:result|output|response|returned|shows?|found|gave|produced)\s*[:.]/gi,
+
+  // "Result from/returned by X:" or "Output from X:" or "Response from tool X:"
+  /\b(?:result|output|response)(?:\s+(?:from|of|returned\s+by|given\s+by))\s+(?:the\s+)?[a-z_]+(?:\.\w+)?(?:\s+(?:tool|command|function))?\s*[:.]/gi,
+
+  // "Running/Executing command/tool X..."
+  /\b(?:[Rr]unning|[Ee]xecuting|[Ii]nvoking|[Cc]alling)\s+(?:the\s+)?(?:following\s+)?(?:command|tool|function|script)\s*[:.]/gi,
+
+  // "Command output:" or "Shell output:" or "Tool output:"
+  /\b(?:[Cc]ommand|[Ss]hell|[Tt]ool|[Ss]cript)\s+(?:output|result|response)\s*[:.]/gi,
+
+  // "I ran/executed/called X and it returned/showed..."
+  /\bI\s+(?:ran|executed|called|used|invoked)\s+[a-z_]+(?:\.\w+)?\s+(?:and\s+)?(?:it\s+)?(?:returned|showed|produced|gave|output(?:ted)?|found)/gi,
+
+  // "Based on the output/result from X..."
+  /\b[Bb]ased\s+on\s+(?:the\s+)?(?:output|result|response|content|data|findings)(?:\s+(?:from|of|returned\s+by))?(?:\s+(?:the\s+)?[a-z_]+(?:\.\w+)?)?/gi,
+
+  // "After calling/running/executing X..."
+  /\b[Aa]fter\s+(?:calling|running|executing|using|invoking)\s+(?:the\s+)?[a-z_]+(?:\.\w+)?/gi,
+
+  // "Let me use/call/run X tool..."
+  /\b[Ll]et\s+me\s+(?:use|call|run|execute|invoke|try)\s+(?:the\s+)?[a-z_]+(?:\.\w+)?\s+(?:tool|command|function)/gi,
+
+  // Single-line "Tool X:" at start of line (describing a tool call in text)
+  /^(?:[Tt]ool|Command|Function)\s+[a-z_]+(?:\.\w+)?\s*[:.].*$/gm,
+
+  // "I'll use/run X" (without "tool" word but referencing a tool-like name)
+  /\bI(?:'ll|\s+will)\s+(?:use|run|call|invoke|execute)\s+(?:[a-z_]+\s+){0,2}(?:to\s+)/gi,
+
+  // "The output/result shows/contains/indicates... (tool result echo)"
+  /\b[Tt]he\s+(?:output|result)\s+(?:shows?|contains?|indicates?|reveals?|displays?|produced|gave|returned)\b/gi,
+];
+
+/**
+ * Strip tool-usage echo from model output.
+ * The model sometimes injects natural-language descriptions of its own tool
+ * usage (e.g., "I'll use the read_file tool to read the file"). These are
+ * redundant because tool_calls are already structured data. This function
+ * removes those echo lines from the text output.
+ */
+export function stripToolEcho(text: string): string {
+  if (!text) return '';
+
+  let result = text;
+  const originalLines = text.split('\n');
+  const filteredLines: string[] = [];
+
+  for (const line of originalLines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      filteredLines.push(line);
+      continue;
+    }
+
+    // Check if this line matches any echo pattern
+    let isEcho = false;
+    for (const pattern of TOOL_ECHO_PATTERNS) {
+      if (pattern.test(trimmed)) {
+        isEcho = true;
+        break;
+      }
+    }
+
+    if (!isEcho) {
+      filteredLines.push(line);
+    }
+  }
+
+  result = filteredLines.join('\n');
+
+  // Clean up excess blank lines left by removals
+  result = result.replace(/\n{3,}/g, '\n\n').trim();
+
+  return result;
+}
+
+/**
+ * Attempts to repair common JSON syntax errors in tool call strings.
+ * Inspired by LangServe's auto-repair pattern for graceful recovery.
+ * 
+ * @param malformedJson - The potentially malformed JSON string
+ * @returns Repaired JSON string, or null if repair is not possible
+ */
+export function repairMalformedJson(malformedJson: string): string | null {
+  let fixed = malformedJson.trim();
+  
+  // Skip if already valid
+  try {
+    JSON.parse(fixed);
+    return null; // Already valid, no repair needed
+  } catch {
+    // Continue with repair attempts
+  }
+  
+  // Fix 1: Replace single quotes with double quotes (common AI output error)
+  fixed = fixed.replace(/'/g, '"');
+  
+  // Fix 2: Remove trailing commas before } or ]
+  fixed = fixed.replace(/,\s*([}\]])/g, '$1');
+  
+  // Fix 3: Ensure keys are double-quoted (handle unquoted keys)
+  // Match: {key: or ,key: and replace with {"key": or ,"key":
+  fixed = fixed.replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)/g, '$1"$2"$3');
+  
+  // Fix 4: Handle missing closing braces/brackets (simple heuristic)
+  const openBraces = (fixed.match(/{/g) || []).length;
+  const closeBraces = (fixed.match(/}/g) || []).length;
+  const openBrackets = (fixed.match(/\[/g) || []).length;
+  const closeBrackets = (fixed.match(/\]/g) || []).length;
+  
+  if (openBraces > closeBraces) {
+    fixed += '}'.repeat(openBraces - closeBraces);
+  }
+  if (openBrackets > closeBrackets) {
+    fixed += ']'.repeat(openBrackets - closeBrackets);
+  }
+  
+  // Final validation: only return if now valid JSON
+  try {
+    JSON.parse(fixed);
+    return fixed;
+  } catch {
+    return null; // Repair failed
+  }
 }
 
 /**

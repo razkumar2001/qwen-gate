@@ -13,7 +13,9 @@ import { StreamingContentFilter } from './pipeline/StreamingContentFilter.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import modelSpecs from '../models.json' with { type: 'json' };
 import { logStore } from '../services/logStore.ts';
+import { modelRouter } from '../services/modelRouter.ts';
 import { pickAccount, getAccountStats } from '../services/auth.ts';
+import { rateLimitMiddleware } from '../middleware/rateLimit.ts';
 
 // Debug logging — enabled via DEBUG=true env var
 function logDebug(label: string, data: any) {
@@ -152,33 +154,87 @@ function cleanThinkTags(t: string): string {
   return t.replace(/<\/?(?:think|thinking|thought|tool_call|tool_use|function_call|tool)>/gi, '');
 }
 
+/**
+ * Truncate large tool results to prevent context pollution.
+ * Smart elision: keep head + tail with truncation marker.
+ * Preserves UTF-8 character boundaries.
+ */
+export function truncateToolResult(
+  content: string,
+  maxBytes: number = 4096,
+): string {
+  if (!content) return '';
+  const encoded = new TextEncoder().encode(content);
+  if (encoded.length <= maxBytes) return content;
+
+  const headBytes = Math.floor(maxBytes * 0.45);
+  const tailBytes = Math.floor(maxBytes * 0.45);
+
+  const headView = new Uint8Array(encoded.buffer, 0, headBytes);
+  const head = new TextDecoder('utf-8', { fatal: false }).decode(headView);
+
+  const tailStart = encoded.length - tailBytes;
+  const tailView = new Uint8Array(encoded.buffer, tailStart, tailBytes);
+  const tail = new TextDecoder('utf-8', { fatal: false }).decode(tailView);
+
+  return `${head}\n... [truncated ${content.length - headBytes - tailBytes} chars] ...\n${tail}`;
+}
+
 // Always-injected tool calling format instruction — model must know the format even when no tools are provided
 // so it can handle tool calls in multi-turn conversations correctly.
 // HIGHEST PRIORITY: This is the #1 rule. Incorrect format breaks the streaming pipeline.
 // Only the correct JSON format is shown. Never mention alternative formats —
 // showing them teaches the model about them and increases the chance they get used.
 const TOOL_FORMAT_INSTRUCTION = `
-## OUTPUT RULES — HIGHEST PRIORITY
+## TOOL DISCIPLINE — HIGHEST PRIORITY
 
-### CORRECT FORMAT
+You are a precise tool-calling assistant. Follow these rules:
+
+### 1. TOOL SELECTION
+- Only call tools explicitly listed in your available_tools.
+- Never invent new tool names or parameters.
+- If uncertain about a parameter, ask for clarification instead of guessing.
+
+### 2. OUTPUT FORMAT
 When calling a tool, output ONLY a single line of raw JSON:
 {"name": "read_file", "arguments": {"path": "src/main.ts"}}
 {"name": "glob", "arguments": {"pattern": "**/*.ts"}}
 {"name": "bash", "arguments": {"command": "ls -la"}}
 
-### RULES
-1. "name" must be a plain string — the tool name
-2. "arguments" must be a JSON object — not a string, not a number
-3. Output each tool call on its own line, one JSON object per line
-4. Output text answers as plain text with no special formatting
-5. Your private reasoning is never shown to the user — answer directly
-6. Do not prefix answers with "Thinking:", "I am", "Let me", or any reasoning text
+Rules:
+- "name" must be a plain string — the tool name
+- "arguments" must be a JSON object — not a string, not a number
+- Output each tool call on its own line, one JSON object per line
+- Never wrap tool calls in fences, backticks, or XML tags
+- Never output raw JSON with explanatory text around it
 
+### 3. TOOL LIMITS (CRITICAL)
+Limits only apply when you call tools CORRECTLY. Malformed calls won't execute AND won't count toward your limit — but they also won't help you.
 
-### CRITICAL
-Never wrap tool calls in fences or backticks.
-Never output raw JSON with text around it.
-This is the highest priority rule — incorrect format causes cascading failures.
+Each VALID tool call consumes context attention. You MUST limit yourself to AT MOST 2 tools per response.
+- Pick the ONE tool that gives the most useful information. Make it count.
+- Prefer combining operations: one well-crafted "bash" command beats three separate tool calls.
+- If you need 3+ tools, STOP. Ask a clarifying question instead.
+- Calling more than 2 tools will trigger the circuit breaker — your tool calls will be rejected.
+
+### 4. NO NARRATION
+Do NOT write sentences like:
+- "I'll use the X tool to..."
+- "Let me search for..."
+- "Based on the output of..."
+- "The tool returned..."
+
+The JSON tool call IS the communication. You may include a ONE-SENTENCE summary of what you found, but never describe the tool itself or what it did.
+
+### 5. ERROR RECOVERY
+If a tool call fails validation:
+- Retry once with corrected parameters
+- If it fails again, report the error clearly using the field-path format: "arguments.path: expected string, got number"
+- Do not silently ignore errors
+
+### 6. PRIVATE REASONING
+Your private reasoning is never shown to the user — answer directly.
+Do not prefix answers with "Thinking:", "I am", "Let me", or any reasoning text.
 `;
 
 function parseQwenErrorPayload(raw: string): { message: string; status: ContentfulStatusCode } | null {
@@ -236,6 +292,7 @@ export async function chatCompletions(c: Context) {
       tool_choice: body.tool_choice ? (typeof body.tool_choice === 'string' ? body.tool_choice : JSON.stringify(body.tool_choice)) : null,
       lastMessage: messages.length > 0 ? safeTruncate(messages[messages.length - 1].content, 300) : '',
     };
+    logEntry.rawRequestBody = JSON.stringify(body);
 
     if (process.env.DEBUG) {
       logDebug('INCOMING REQUEST', {
@@ -327,9 +384,7 @@ export async function chatCompletions(c: Context) {
             }
           }
         }
-        const truncated = (contentStr || '').length > 4096
-          ? (contentStr || '').substring(0, 4096) + '\n[...truncated]'
-          : (contentStr || '');
+        const truncated = truncateToolResult(contentStr || '', 4096);
         prompt += `Tool Response (${toolName || 'tool'}): ${truncated}\n\n`;
       }
     }
@@ -395,21 +450,34 @@ export async function chatCompletions(c: Context) {
     const sessionHeaders = session.cachedHeaders;
     const resolvedEmail = session.accountEmail || accountEmail;
 
+    // Update log entry with the resolved account email
+    logEntry.accountEmail = resolvedEmail || '';
+
     const emailLabel = resolvedEmail ? ` account=${resolvedEmail.split('@')[0]}` : '';
     console.log(`[Chat] model=${body.model} session=${session.chatId.substring(0,8)}... stream=${isStream} thinking=${!body.model.includes('no-thinking')}${emailLabel}`);
+
+    // Route model through fallback chain with health-based selection
+    const routedModel = await modelRouter.route(body.model);
+    if (routedModel !== body.model) {
+      console.log(`[Chat] Model routed: ${body.model} → ${routedModel}`);
+    }
 
     // Retry logic with exponential backoff for transient errors
     let stream: ReadableStream;
     let uiSessionId = session.chatId;
     try {
-      const result = await createQwenStream(finalPrompt, isThinkingModel, body.model, session.chatId, nextParentId, resolvedEmail);
+      const result = await createQwenStream(finalPrompt, isThinkingModel, routedModel, session.chatId, nextParentId, resolvedEmail);
       stream = result.stream;
       uiSessionId = result.uiSessionId;
+      // Record success for health tracking
+      modelRouter.recordSuccess(routedModel);
       // Account may have rotated during retry (rate limit → switch account)
       if (result.accountEmail && result.accountEmail !== resolvedEmail) {
         console.log(`[Chat] Account rotated: ${resolvedEmail?.split('@')[0]} → ${result.accountEmail.split('@')[0]}`);
       }
     } catch (err: any) {
+      // Record error for health tracking and potential degradation
+      modelRouter.recordError(routedModel);
       sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail);
       throw err;
     }
@@ -699,7 +767,8 @@ export async function chatCompletions(c: Context) {
 
     c.header('Content-Type', 'text/event-stream');
     c.header('Cache-Control', 'no-cache');
-    c.header('Connection', 'close'); // Close TCP socket when response ends — don't keep alive
+    c.header('Connection', 'close');
+    c.header('X-ToolCalls-Limit', String(process.env.MAX_TOOL_CALLS_PER_REQUEST || 10));
 
     return honoStream(c, async (streamWriter: any) => {
       let heartbeatInterval: any;

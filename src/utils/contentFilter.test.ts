@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { filterContent, stripToolCallArtifacts } from './contentFilter.ts';
+import { filterContent, stripToolCallArtifacts, stripToolEcho } from './contentFilter.ts';
 
 test('filterContent preserves instructional "I want to" prose', () => {
   const input = 'I want to help you fix this bug.\n\nThe issue is in auth.ts line 42 where the token check uses < instead of <=.';
@@ -63,4 +63,102 @@ test('stripToolCallArtifacts preserves normal JSON', () => {
   const result = stripToolCallArtifacts(input);
   // JSON without "name" field should be preserved
   assert.ok(result.includes('"key"'), `Should keep non-tool JSON: "${result}"`);
+});
+
+// ─── Tool Echo Guard Tests ─────────────────────────────────────────────
+
+test('stripToolEcho: strips "I will use the X tool to..."', () => {
+  const input = 'I will use the read_file tool to read the file.\nHere is what I found: the file is empty.';
+  const result = stripToolEcho(input);
+  assert.ok(!result.includes('use the read_file tool'), 'Should strip tool usage narration');
+  assert.ok(result.includes('Here is what I found'), 'Should keep actual content');
+});
+
+test('stripToolEcho: strips "I will run the bash tool..."', () => {
+  const input = 'I will run the bash tool to execute the command.\n{"name":"bash","arguments":{"command":"ls"}}';
+  const result = stripToolEcho(input);
+  assert.ok(!result.includes('I will run the bash'), 'Should strip tool usage narration');
+});
+
+test('stripToolEcho: strips "The X tool returned..."', () => {
+  const input = 'The read_file tool returned the file contents.\nThe file contains 42 lines.';
+  const result = stripToolEcho(input);
+  assert.ok(!result.includes('tool returned'), 'Should strip tool result echo');
+  assert.ok(result.includes('42 lines'), 'Should keep actual content');
+});
+
+test('stripToolEcho: strips "Tool X result:"', () => {
+  const input = 'Tool bash result: command completed successfully.\nThe output was empty.';
+  const result = stripToolEcho(input);
+  assert.ok(!result.includes('Tool bash result'), 'Should strip tool result prefix');
+  assert.ok(result.includes('output was empty'), 'Should keep actual content');
+});
+
+test('stripToolEcho: strips "Based on the output from X..."', () => {
+  const input = 'Based on the output from grep, the pattern was found.\nThe matching line is: import fs from "fs";';
+  const result = stripToolEcho(input);
+  assert.ok(!result.includes('Based on the output'), 'Should strip tool-echo reasoning');
+  assert.ok(result.includes('import fs'), 'Should keep actual content');
+});
+
+test('stripToolEcho: strips "Let me use X tool..."', () => {
+  const input = 'Let me use the glob tool to search for files.\nFound: src/index.ts, src/main.ts';
+  const result = stripToolEcho(input);
+  assert.ok(!result.includes('Let me use the glob'), 'Should strip tool preamble');
+  assert.ok(result.includes('Found:'), 'Should keep actual content');
+});
+
+test('stripToolEcho: preserves normal instructional content', () => {
+  const input = 'I will help you fix this bug.\nThe issue is in auth.ts line 42.';
+  const result = stripToolEcho(input);
+  assert.ok(result.includes('help you fix'), 'Should keep non-tool instructional content');
+  assert.ok(result.includes('auth.ts'), 'Should keep file references');
+});
+
+test('stripToolEcho: strips "Running command:"', () => {
+  const input = 'Running command: ls -la\n\n{"name":"bash","arguments":{"command":"ls -la"}}';
+  const result = stripToolEcho(input);
+  assert.ok(!result.includes('Running command'), 'Should strip command echo');
+});
+
+test('stripToolEcho: preserves short descriptions without tool echo', () => {
+  const input = 'Found 3 files matching the pattern.\n\nsrc/index.ts\nsrc/main.ts\nsrc/utils.ts';
+  const result = stripToolEcho(input);
+  assert.ok(result.includes('Found 3 files'), 'Should keep short useful descriptions');
+  assert.ok(result.includes('src/index.ts'), 'Should keep file listings');
+});
+
+test('stripToolEcho: strips "I will use X (without tool word)" when referencing tool-like names', () => {
+  const input = 'I will execute read_file to check the file.';
+  const result = stripToolEcho(input);
+  assert.ok(!result.includes('I will execute'), 'Should strip tool intent narration');
+});
+
+test('stripToolEcho: strips multi-line echo patterns', () => {
+  const input = 'I will use the bash tool to run the command.\nThe bash tool returned: success.\nThe output shows the file exists.';
+  const result = stripToolEcho(input);
+  assert.ok(result === '', 'All lines should be stripped as echo');
+});
+
+test('stripToolEcho: strips "After running X..." preface', () => {
+  const input = 'After running read_file, I can see the file contains:\n\nHello world';
+  const result = stripToolEcho(input);
+  assert.ok(!result.includes('After running'), 'Should strip after-running preface');
+  assert.ok(result.includes('Hello world'), 'Should keep actual content');
+});
+
+test('stripToolEcho: integrated via stripToolCallArtifacts', () => {
+  const input = 'I will use the read_file tool to read the file.\n{"name":"read_file","arguments":{"path":"test.ts"}}\nThe read_file tool returned: file content.\nHere is what I found:\n\nThe file is empty.';
+  const result = stripToolCallArtifacts(input);
+  assert.ok(!result.includes('use the read_file tool'), 'Should strip tool usage narration');
+  assert.ok(!result.includes('"name"'), 'Should strip tool call JSON');
+  assert.ok(!result.includes('tool returned'), 'Should strip tool result echo');
+  assert.ok(result.includes('Here is what I found'), 'Should keep actual content');
+  assert.ok(result.includes('file is empty'), 'Should keep useful info');
+});
+
+test('stripToolEcho: does not strip user-facing answers that reference tools naturally', () => {
+  const input = 'I used the grep command and found the pattern. Here are the matches:\n\nline1: foo\nline2: bar';
+  const result = stripToolEcho(input);
+  assert.ok(result.includes('line1'), 'Should keep actual results');
 });

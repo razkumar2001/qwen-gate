@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
-import { getBasicHeaders } from './playwright.ts';
-import { pickAccount } from './auth.ts';
+import { getBasicHeaders, type BasicHeaders } from './playwright.ts';
+import { pickAccount, incrementInFlight, decrementInFlight, incrementTotalRequests, getAccountByEmail } from './auth.ts';
 import { createNetworkEntry, recordResponse, completeEntry, errorEntry } from './networkDebug.ts';
 
 interface PoolEntry {
@@ -58,22 +58,34 @@ export class SessionPool {
     // If no email specified, pick the best account
     const resolvedEmail = email || pickAccount()?.email;
 
-    const [{ cookie, userAgent, email: actualEmail }, chatId] = await Promise.all([
-      getBasicHeaders(resolvedEmail),
-      this.createSession(resolvedEmail)
-    ]);
-    const entry: PoolEntry = {
-      chatId,
-      parentId: null,
-      inUse: true,
-      cachedHeaders: { cookie, userAgent },
-      accountEmail: actualEmail || resolvedEmail,
-    };
-    this.activeSessions.add(chatId);
-    this.activeCount++;
-    const emailLabel = entry.accountEmail ? ` (${entry.accountEmail.split('@')[0]})` : '';
-    console.log(`[SessionPool] Fresh session: ${chatId.substring(0, 8)}...${emailLabel}`);
-    return entry;
+    // Mark account as in-flight before starting async ops (runs synchronously, no race)
+    if (resolvedEmail) {
+      incrementInFlight(resolvedEmail);
+    }
+
+    try {
+      const [{ cookie, userAgent, email: actualEmail }, chatId] = await Promise.all([
+        getBasicHeaders(resolvedEmail),
+        this.createSession(resolvedEmail)
+      ]);
+      const entry: PoolEntry = {
+        chatId,
+        parentId: null,
+        inUse: true,
+        cachedHeaders: { cookie, userAgent },
+        accountEmail: actualEmail || resolvedEmail,
+      };
+      this.activeSessions.add(chatId);
+      this.activeCount++;
+      const emailLabel = entry.accountEmail ? ` (${entry.accountEmail.split('@')[0]})` : '';
+      console.log(`[SessionPool] Fresh session: ${chatId.substring(0, 8)}...${emailLabel}`);
+      return entry;
+    } catch (err) {
+      if (resolvedEmail) {
+        decrementInFlight(resolvedEmail);
+      }
+      throw err;
+    }
   }
 
   getWaitingCount(): number {
@@ -104,6 +116,12 @@ export class SessionPool {
   }
 
   release(chatId: string, _newParentId: string | null, cachedHeaders?: { cookie: string; userAgent: string }, accountEmail?: string): void {
+    // Track completed request — decrement in-flight, bump total count
+    if (accountEmail) {
+      decrementInFlight(accountEmail);
+      incrementTotalRequests(accountEmail);
+    }
+
     const waiter = this.waiting.shift();
     if (waiter) {
       clearTimeout(waiter.timer);
@@ -184,12 +202,33 @@ export class SessionPool {
   }
 
   private async createSession(email?: string): Promise<string> {
-    const { cookie, userAgent } = await getBasicHeaders(email);
+    const headers = await getBasicHeaders(email);
+    const { cookie, userAgent, bxUmidtoken, bxUa, bxV } = headers;
     const requestId = uuidv4();
+
+    const acct = email ? getAccountByEmail(email) : null;
+    const bearerToken = acct?.state?.token;
+
+    const fetchHeaders: Record<string, string> = {
+      'accept': 'application/json, text/plain, */*',
+      'content-type': 'application/json',
+      'cookie': cookie,
+      'referer': 'https://chat.qwen.ai/',
+      'user-agent': userAgent,
+      'x-request-id': requestId,
+      'source': 'web',
+      'bx-umidtoken': bxUmidtoken,
+      'bx-ua': bxUa,
+      'bx-v': bxV,
+    };
+    if (bearerToken) {
+      fetchHeaders['authorization'] = `Bearer ${bearerToken}`;
+    }
+
     const debugEntry = createNetworkEntry({
       url: 'https://chat.qwen.ai/api/v2/chats/new',
       method: 'POST',
-      headers: { cookie, 'user-agent': userAgent, 'x-request-id': requestId, source: 'web' },
+      headers: fetchHeaders,
       body: {},
       category: 'session-create',
       accountEmail: email,
@@ -199,15 +238,7 @@ export class SessionPool {
     try {
       response = await fetch('https://chat.qwen.ai/api/v2/chats/new', {
         method: 'POST',
-        headers: {
-          'accept': 'application/json, text/plain, */*',
-          'content-type': 'application/json',
-          'cookie': cookie,
-          'referer': 'https://chat.qwen.ai/',
-          'user-agent': userAgent,
-          'x-request-id': requestId,
-          'source': 'web',
-        },
+        headers: fetchHeaders,
         body: JSON.stringify({}),
       });
       recordResponse(debugEntry.id, response);

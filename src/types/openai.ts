@@ -57,6 +57,7 @@ export interface FunctionToolDefinition {
     parameters?: JsonSchema;
     strict?: boolean;
   };
+  inputSchema?: JsonSchema;
 }
 
 // ─── Tool Choice ───────────────────────────────────────────────────────────────

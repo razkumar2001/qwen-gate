@@ -1,13 +1,23 @@
-import { chromium, firefox, webkit, BrowserContext, Page } from 'playwright';
+import { chromium, firefox, webkit, BrowserContext, Page, Cookie } from 'playwright';
 import path from 'path';
 import crypto from 'crypto';
-import { getToken, getTokenWithAccount, ensureAuthenticated } from './auth.ts';
+import { mkdirSync } from 'fs';
+import { getToken, getTokenWithAccount, ensureAuthenticated, pickAccount } from './auth.ts';
 
 export type BrowserType = 'chromium' | 'firefox' | 'webkit' | 'chrome' | 'edge';
 
-let context: BrowserContext | null = null;
-export let activePage: Page | null = null;
-let currentHeaders: Record<string, string> = {};
+// Per-account isolated browser contexts
+export interface AccountContext {
+  context: BrowserContext;
+  page: Page;
+  lastRefresh: number;
+  cookies: Record<string, string>;
+  headers: Record<string, string>;
+  refreshInterval?: NodeJS.Timeout;
+}
+
+const accountContexts = new Map<string, AccountContext>();
+let defaultBrowser: any = null; // Shared browser instance for creating contexts
 let initInFlight: Promise<void> | null = null;
 let cachedQwenHeaders: { headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null } | null = null;
 let lastHeadersTime = 0;
@@ -20,7 +30,23 @@ let lastCookiesTime = 0;
 const COOKIES_TTL = 30 * 1000; // 30 seconds — cookies change rarely
 let cookiesInFlight: Promise<string> | null = null;
 
+// Cookie refresh interval (30s)
+const COOKIE_REFRESH_INTERVAL = 30 * 1000;
+// Context cleanup TTL (30min inactivity)
+const CONTEXT_CLEANUP_TTL = 30 * 60 * 1000;
+
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Get persistent profile directory for an account.
+ * Sanitizes email to filesystem-safe name: youssefbue@gmail.com → youssefbue_gmail_com
+ */
+export function getProfileDir(email: string): string {
+  const safe = email.toLowerCase().trim().replace(/[^a-z0-9]/g, '_');
+  const dir = path.join(process.cwd(), 'qwen_profile', 'chromium-profiles', safe);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
 
 export class Mutex {
   private queue: (() => void)[] = [];
@@ -51,9 +77,18 @@ export class Mutex {
 // Lock to prevent concurrent UI interactions
 const uiMutex = new Mutex();
 
-export async function getCookies(): Promise<string> {
+export async function getCookies(email?: string): Promise<string> {
   if (process.env.TEST_MOCK_PLAYWRIGHT) return 'token=mock';
-  if (!activePage) return '';
+  
+  // If email specified, get cookies from that account's context ONLY — never from global cache
+  if (email) {
+    const accCtx = accountContexts.get(email);
+    if (!accCtx) return '';
+    const cookies = await accCtx.context.cookies();
+    return cookies.map(c => `${c.name}=${c.value}`).join('; ');
+  }
+  
+  // Fallback: get cookies from any available context (with global cache)
   if (cachedCookies && (Date.now() - lastCookiesTime < COOKIES_TTL)) {
     return cachedCookies;
   }
@@ -62,46 +97,74 @@ export async function getCookies(): Promise<string> {
     if (cachedCookies && (Date.now() - lastCookiesTime < COOKIES_TTL)) {
       return cachedCookies;
     }
-    const page = activePage;
-    if (!page) return '';
-    const cookies = await page.context().cookies();
-    cachedCookies = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-    lastCookiesTime = Date.now();
-    return cachedCookies!;
+    // Get first available context
+    for (const accCtx of accountContexts.values()) {
+      const cookies = await accCtx.context.cookies();
+      cachedCookies = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+      lastCookiesTime = Date.now();
+      return cachedCookies!;
+    }
+    return '';
   })().finally(() => {
     cookiesInFlight = null;
   });
   return cookiesInFlight;
 }
 
-export async function getBasicHeaders(email?: string): Promise<{ cookie: string, userAgent: string, bxV: string, email?: string }> {
-  if (process.env.TEST_MOCK_PLAYWRIGHT) return { cookie: 'token=mock', userAgent: 'mock', bxV: '2.5.36', email: 'mock@test' };
-  if (!activePage) throw new Error('Playwright not initialized');
+export interface BasicHeaders {
+  cookie: string;
+  userAgent: string;
+  bxV: string;
+  bxUmidtoken: string;
+  bxUa: string;
+  email?: string;
+}
+
+export async function getBasicHeaders(email?: string): Promise<BasicHeaders> {
+  if (process.env.TEST_MOCK_PLAYWRIGHT) return { cookie: 'token=mock', userAgent: 'mock', bxV: '2.5.36', bxUmidtoken: '', bxUa: '', email: 'mock@test' };
+  
+  await initPlaywright();
   
   // P0: Use cached userAgent (never changes during browser lifetime)
   if (!cachedUserAgent) {
-    cachedUserAgent = await activePage.evaluate(() => navigator.userAgent, { timeout: 10_000 } as any);
+    // Get userAgent from any available context
+    for (const accCtx of accountContexts.values()) {
+      cachedUserAgent = await accCtx.page.evaluate(() => navigator.userAgent, { timeout: 10_000 } as any);
+      break;
+    }
+    if (!cachedUserAgent) {
+      cachedUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+    }
   }
   
-  let cookieStr = await getCookies();
+  let cookieStr = await getCookies(email);
 
   // Inject auth token from our auth service into the cookie if present
-  // If email specified, use that account's token. Otherwise pick best available.
   const tokenInfo = getTokenWithAccount(email);
   if (tokenInfo) {
     const tokenEntry = `token=${tokenInfo.token}`;
-    // Prepend auth token so it takes priority
     cookieStr = tokenEntry + (cookieStr ? '; ' + cookieStr : '');
   }
 
-  const bxV = currentHeaders['bx-v'] || '2.5.36';
+  const bxV = '2.5.36';
+
+  // Extract bx-headers from the per-account context (already captured by route handler)
+  let bxUmidtoken = '';
+  let bxUa = '';
+  if (email) {
+    const accCtx = accountContexts.get(email);
+    if (accCtx?.headers) {
+      bxUmidtoken = accCtx.headers['bx-umidtoken'] || '';
+      bxUa = accCtx.headers['bx-ua'] || '';
+    }
+  }
   
-  return { cookie: cookieStr, userAgent: cachedUserAgent, bxV, email: tokenInfo?.email };
+  return { cookie: cookieStr, userAgent: cachedUserAgent, bxV, bxUmidtoken, bxUa, email: tokenInfo?.email };
 }
 
 export async function initPlaywright(headless = true, browserType: BrowserType = 'chromium') {
   if (process.env.TEST_MOCK_PLAYWRIGHT) return;
-  if (context) {
+  if (defaultBrowser) {
     return;
   }
   // Dedupe: if another caller is already initializing, wait for it
@@ -111,10 +174,8 @@ export async function initPlaywright(headless = true, browserType: BrowserType =
   }
   initInFlight = (async () => {
     // Re-check after acquiring — another caller may have finished while we waited
-    if (context) return;
+    if (defaultBrowser) return;
 
-  const profilePath = path.resolve('qwen_profile');
-  
   let browserEngine;
   let channel: string | undefined;
 
@@ -141,44 +202,204 @@ export async function initPlaywright(headless = true, browserType: BrowserType =
 
   console.log(`[Playwright] Launching ${browserType}...`);
 
-  context = await browserEngine.launchPersistentContext(profilePath, {
+  // Launch shared browser instance (not persistent context) for creating isolated contexts per account
+  defaultBrowser = await browserEngine.launch({
     headless,
     channel,
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
     ignoreDefaultArgs: ['--enable-automation'],
     args: [
       '--disable-blink-features=AutomationControlled'
     ]
   });
 
-  // Bypass navigator.webdriver detection
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', {
-      get: () => undefined,
-    });
-  });
+  // Setup cleanup handlers for graceful shutdown
+  const cleanupAllContexts = async () => {
+    console.log('[AccountContext] Cleaning up all browser contexts...');
+    for (const [email, accCtx] of accountContexts.entries()) {
+      if (accCtx.refreshInterval) clearInterval(accCtx.refreshInterval);
+      await accCtx.context.close();
+      console.log(`[AccountContext] Closed ${email}`);
+    }
+    accountContexts.clear();
+    if (defaultBrowser) {
+      await defaultBrowser.close();
+      defaultBrowser = null;
+    }
+  };
+  process.on('exit', () => { /* sync cleanup not possible, rely on SIGTERM */ });
+  process.on('SIGTERM', cleanupAllContexts);
+  process.on('SIGINT', cleanupAllContexts);
 
-  // Keep an active page to fetch PoW headers on demand
-  activePage = await context.newPage();
+  console.log('[AccountContext] Browser initialized, contexts will be created on-demand');
 
-  const hasValidSession = await checkValidSession();
-  if (!hasValidSession) {
-    await attemptAutoLogin();
-  }
+  console.log('[AccountContext] Browser initialized, contexts will be created on-demand');
   })().finally(() => {
     initInFlight = null;
   });
   return initInFlight;
 }
 
-async function checkValidSession(): Promise<boolean> {
-  if (!activePage) return false;
+/**
+ * Create a new isolated BrowserContext for a specific account
+ */
+export async function createAccountContext(email: string, cookies?: Record<string, string>): Promise<AccountContext> {
+  if (process.env.TEST_MOCK_PLAYWRIGHT) {
+    // Mock context for testing
+    return {
+      context: null as any,
+      page: null as any,
+      lastRefresh: Date.now(),
+      cookies: cookies || {},
+      headers: {}
+    };
+  }
+  
+  await initPlaywright();
+  if (!defaultBrowser) throw new Error('Playwright browser not initialized');
+  
+  // Check if context already exists
+  if (accountContexts.has(email)) {
+    return accountContexts.get(email)!;
+  }
+  
+  console.log(`[AccountContext] Creating context for ${email}`);
+  
+  // Create new isolated context with storage state if cookies provided
+  const context = await defaultBrowser.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    ignoreDefaultArgs: ['--enable-automation'],
+    storageState: cookies ? { cookies: Object.entries(cookies).map(([name, value]) => ({
+      name,
+      value,
+      domain: '.qwen.ai',
+      path: '/',
+      expires: Math.floor(Date.now() / 1000) + 3600,
+      httpOnly: true,
+      secure: true,
+      sameSite: 'Lax'
+    } as Cookie)), origins: [] } : undefined
+  });
+  
+  // Bypass navigator.webdriver detection
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', {
+      get: () => undefined,
+    });
+  });
+  
+  const page = await context.newPage();
+  
+  // Setup header extraction via page.route
+  const extractedHeaders: Record<string, string> = {};
+  const routeHandler = async (route: any, request: any) => {
+    const headers = request.headers();
+    if (headers['bx-umidtoken']) extractedHeaders['bx-umidtoken'] = headers['bx-umidtoken'];
+    if (headers['bx-ua']) extractedHeaders['bx-ua'] = headers['bx-ua'];
+    if (headers['user-agent']) extractedHeaders['user-agent'] = headers['user-agent'];
+    await route.continue();
+  };
+  await page.route('**/api/**', routeHandler);
+  
+  // Inject initial cookies if provided
+  if (cookies) {
+    const cookieList = Object.entries(cookies).map(([name, value]) => ({
+      name,
+      value,
+      domain: 'chat.qwen.ai',
+      path: '/',
+      secure: true,
+      httpOnly: true
+    }));
+    await context.addCookies(cookieList);
+  }
+  
+  const accCtx: AccountContext = {
+    context,
+    page,
+    lastRefresh: Date.now(),
+    cookies: cookies || {},
+    headers: extractedHeaders
+  };
+  
+  accountContexts.set(email, accCtx);
+  console.log(`[AccountContext] Created ${email}`);
+  
+  // Start auto-refresh interval for cookies (every 30s)
+  accCtx.refreshInterval = setInterval(async () => {
+    try {
+      await refreshAccountCookies(email);
+    } catch (err) {
+      console.error(`[AccountContext] Refresh failed for ${email}:`, err);
+    }
+  }, COOKIE_REFRESH_INTERVAL);
+  
+  return accCtx;
+}
+
+/**
+ * Refresh cookies for a specific account context without full navigation
+ */
+export async function refreshAccountCookies(email: string): Promise<void> {
+  if (process.env.TEST_MOCK_PLAYWRIGHT) return;
+  
+  const accCtx = accountContexts.get(email);
+  if (!accCtx) return;
+  
+  const { context, page } = accCtx;
+  
   try {
-    const cookies = await activePage.context().cookies();
+    // Check if context is still valid by checking cookies
+    const cookies = await context.cookies();
+    const hasAuthCookie = cookies.some(c => c.name.toLowerCase().includes('token') || c.name.toLowerCase().includes('session'));
+    
+    if (!hasAuthCookie) {
+      // Context expired, need to navigate to refresh
+      console.log(`[AccountContext] Context expired for ${email}, navigating to refresh`);
+      await page.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await sleep(2000);
+      
+      // Re-check if we got an auth cookie after navigation
+      const postCookies = await context.cookies();
+      const hasPostAuth = postCookies.some(c => c.name.toLowerCase().includes('token') || c.name.toLowerCase().includes('session'));
+      if (!hasPostAuth) {
+        console.warn(`[AccountContext] ${email} still has no auth cookie after navigation - token invalid, marking unavailable`);
+        const { throttleAccount } = await import('./auth.ts');
+        throttleAccount(email, 120_000);
+        accCtx.cookies = {};
+        accCtx.lastRefresh = Date.now();
+        return;
+      }
+      // Use post-navigation cookies
+      postCookies.splice(0, postCookies.length, ...postCookies);
+    }
+    
+    // Fetch fresh cookies
+    const freshCookies = await context.cookies();
+    const cookieRecord: Record<string, string> = {};
+    for (const c of freshCookies) {
+      cookieRecord[c.name] = c.value;
+    }
+    
+    // Update the account context
+    accCtx.cookies = cookieRecord;
+    accCtx.lastRefresh = Date.now();
+    
+    console.log(`[AccountContext] Refreshed ${email} (${freshCookies.length} cookies)`);
+  } catch (err) {
+    console.error(`[AccountContext] Refresh error for ${email}:`, err);
+    // Don't throw - let the interval continue, next attempt may succeed
+  }
+}
+
+async function checkValidSession(email: string): Promise<boolean> {
+  const accCtx = accountContexts.get(email);
+  if (!accCtx) return false;
+  try {
+    const cookies = await accCtx.context.cookies();
     const hasAuthCookie = cookies.some(c => c.name.toLowerCase().includes('token') || c.name.toLowerCase().includes('session'));
     if (!hasAuthCookie) return false;
-    await activePage.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: 10000 });
-    const isLogged = !activePage.url().includes('auth') && !activePage.url().includes('login');
+    await accCtx.page.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: 10000 });
+    const isLogged = !accCtx.page.url().includes('auth') && !accCtx.page.url().includes('login');
     return isLogged;
   } catch {
     return false;
@@ -210,21 +431,87 @@ async function attemptAutoLogin(): Promise<void> {
 
 export async function closePlaywright() {
   if (process.env.TEST_MOCK_PLAYWRIGHT) return;
-  if (context) {
-    await context.close();
-    context = null;
-    activePage = null;
+  console.log('[AccountContext] Cleaning up all browser contexts...');
+  for (const [email, accCtx] of accountContexts.entries()) {
+    if (accCtx.refreshInterval) clearInterval(accCtx.refreshInterval);
+    await accCtx.context.close();
+    console.log(`[AccountContext] Closed ${email}`);
   }
-  cachedUserAgent = null;
+  accountContexts.clear();
+  if (defaultBrowser) {
+    await defaultBrowser.close();
+    defaultBrowser = null;
+  }
+  console.log('[AccountContext] All contexts closed');
+}
+
+// P0: Expose cached values for external use (e.g., sessionPool)
+export function getCachedUserAgent(): string | null {
+  return cachedUserAgent;
+}
+
+export function getCachedCookies(): string | null {
+  return cachedCookies;
+}
+
+export function getLastCookiesTime(): number {
+  return lastCookiesTime;
+}
+
+export function setCachedCookies(cookies: string, timestamp: number) {
+  cachedCookies = cookies;
+  lastCookiesTime = timestamp;
+}
+
+export function setCachedUserAgent(ua: string) {
+  cachedUserAgent = ua;
+}
+
+// P0: Direct cookie injection for testing/mocking scenarios - per-account
+export async function injectCookies(email: string, cookies: Array<{name: string, value: string, domain?: string, path?: string}>) {
+  if (process.env.TEST_MOCK_PLAYWRIGHT) return;
+  const accCtx = accountContexts.get(email);
+  if (!accCtx) throw new Error(`No context for account ${email}`);
+  await accCtx.context.addCookies(cookies);
+  accCtx.lastRefresh = Date.now();
+  cachedCookies = null;
+  lastCookiesTime = 0;
+}
+
+// P0: Direct page access for advanced scenarios (use with caution) - per-account
+export function getActivePage(email?: string): Page | null {
+  if (email) {
+    return accountContexts.get(email)?.page || null;
+  }
+  // Return first available page if no email specified
+  for (const accCtx of accountContexts.values()) {
+    return accCtx.page;
+  }
+  return null;
+}
+
+// P0: Direct context access for advanced scenarios - per-account
+export function getBrowserContext(email?: string): BrowserContext | null {
+  if (!email) return null;
+  const ctx = accountContexts.get(email);
+  return ctx?.context || null;
+}
+
+/**
+ * Get the underlying Playwright browser instance.
+ * Useful for one-off flows like manual login that need to create temporary contexts.
+ */
+export function getBrowser(): Browser | null {
+  return defaultBrowser || null;
 }
 
 export async function loginToQwen(email: string, password: string): Promise<boolean> {
-  if (!activePage) throw new Error('Playwright not initialized');
+  if (!getActivePage()) throw new Error('Playwright not initialized');
 
   // Serialize: login mutates shared activePage + global cookie jar
   const release = await uiMutex.acquire();
   try {
-  const page = activePage; // capture post-mutex — another caller could have closed it
+  const page = getActivePage()!; // capture post-mutex — another caller could have closed it
 
   console.log(`[Playwright] Attempting API login for ${email}...`);
   
@@ -245,7 +532,7 @@ export async function loginToQwen(email: string, password: string): Promise<bool
           "timezone": new Date().toString().split(' (')[0],
           "x-request-id": crypto.randomUUID()
         },
-        body: JSON.stringify({ email, password, login_type: "email" })
+        body: JSON.stringify({ email, password })
       });
       const data = await response.json();
       return { ok: response.ok, data };
@@ -323,130 +610,87 @@ async function loginToQwenUI(email: string, password: string): Promise<boolean> 
 }
 
 /**
- * Ensures the session is valid and extracts headers, PoW, and session ID.
- * @param forceNew Force fresh header extraction (bypass cache)
- * @param _accountEmail Optional account email (reserved for future per-account header caching)
+ * Capture bx-headers by making a deliberate API call from the page context.
+ * Qwen's frontend JS adds bx-umidtoken and bx-ua to fetch requests automatically.
+ * The route handler intercepts these and saves the headers.
  */
-export async function getQwenHeaders(forceNew = false, _accountEmail?: string): Promise<{ headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null }> {
-  if (!forceNew && cachedQwenHeaders && (Date.now() - lastHeadersTime < HEADERS_TTL)) {
-    return cachedQwenHeaders;
-  }
-
-  const release = await uiMutex.acquire();
+async function captureBxHeaders(accCtx: AccountContext): Promise<void> {
   try {
-    if (!forceNew && cachedQwenHeaders && (Date.now() - lastHeadersTime < HEADERS_TTL)) {
-      return cachedQwenHeaders;
-    }
-    return await _getQwenHeadersInternal(forceNew);
-  } finally {
-    release();
+    await accCtx.page.evaluate(async () => {
+      await fetch('https://chat.qwen.ai/api/v2/models', {
+        method: 'GET',
+        headers: { 'accept': 'application/json', 'source': 'web' },
+      }).catch(() => {});
+    }, { timeout: 10000 } as any);
+    await sleep(500);
+  } catch (err: any) {
+    console.warn(`[AccountContext] bx-header capture fetch failed: ${err.message}`);
   }
 }
 
-async function _getQwenHeadersInternal(forceNew = false): Promise<{ headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null }> {
+/**
+ * Get headers for a specific account or the best available account.
+ * @param email Optional account email - if provided, use that account's context
+ */
+export async function getQwenHeaders(email?: string): Promise<{ headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null }> {
   if (process.env.TEST_MOCK_PLAYWRIGHT) {
-    const mockSessionId = process.env.TEST_SESSION_ID || 'mock-session';
-    return { 
-      headers: { 
-        'authorization': 'Bearer MOCK', 
-        'cookie': 'token=mock', 
-        'user-agent': 'mock',
-        'bx-v': '2.5.36'
-      }, 
-      chatSessionId: mockSessionId, 
-      parentMessageId: null 
+    return {
+      headers: {
+        'bx-umidtoken': 'mock-umid-' + crypto.randomUUID().slice(0, 8),
+        'bx-ua': 'mock-ua-' + crypto.randomUUID().slice(0, 8),
+        'user-agent': 'mock-user-agent',
+        'cookie': 'token=mock'
+      },
+      chatSessionId: 'mock-session-' + crypto.randomUUID().slice(0, 8),
+      parentMessageId: null
     };
   }
 
-  if (!activePage) {
-    throw new Error('Playwright not initialized');
+  await initPlaywright();
+
+  // Determine which account to use
+  const targetEmail = email || pickAccount()?.email;
+  if (!targetEmail) {
+    throw new Error('No account available for header extraction');
   }
 
-  // Capture to local const so TypeScript preserves narrowing inside closures
-  const page = activePage;
+  // Get or create the account context
+  let accCtx = accountContexts.get(targetEmail);
+  if (!accCtx) {
+    // Try to get initial cookies from auth service
+    const tokenInfo = getTokenWithAccount(targetEmail);
+    const initialCookies = tokenInfo?.token ? { token: tokenInfo.token } : undefined;
+    accCtx = await createAccountContext(targetEmail, initialCookies);
+    // Navigate to establish cookies and trigger request interceptors
+    await refreshAccountCookies(targetEmail);
+    // Explicitly capture bx-headers by making a fetch from the page context
+    await captureBxHeaders(accCtx);
+    accCtx = accountContexts.get(targetEmail)!;
+  } else if (Date.now() - accCtx.lastRefresh > COOKIE_REFRESH_INTERVAL) {
+    // Refresh if stale (>30s)
+    await refreshAccountCookies(targetEmail);
+    accCtx = accountContexts.get(targetEmail)!;
+  }
 
-  // Set up route interception BEFORE navigating, so we catch the page's
-  // automatic API calls that carry baxia-generated bx-headers.
-  return new Promise((resolve, reject) => {
-    let done = false;
-    let timeout: NodeJS.Timeout;
+  // Extract current headers from the account's context
+  const cookies = await accCtx.context.cookies();
+  const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+  
+  const headers: Record<string, string> = {
+    ...accCtx.headers,
+    'cookie': cookieStr
+  };
+  
+  // Update cached headers for this account
+  accCtx.headers = headers;
+  accCtx.lastRefresh = Date.now();
 
-    const finish = (headers: Record<string, string> | null, err?: string) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timeout);
-      if (headers && headers['bx-ua']) {
-        resolve({ headers, chatSessionId: '', parentMessageId: null });
-      } else {
-        page.unroute('**/*', routeHandler).catch(() => {});
-        reject(new Error(err || 'Header extraction failed'));
-      }
-    };
-
-    timeout = setTimeout(() => {
-      finish(null, 'Timeout waiting for API calls with bx-headers');
-    }, 45000);
-
-    const routeHandler = async (route: any, request: any) => {
-      try {
-        const reqHeaders = request.headers();
-        if (!reqHeaders['bx-ua']) {
-          try { await route.continue(); } catch {} // cleanup — continue may fail if request already handled
-          return;
-        }
-
-        const extracted = {
-          'cookie': reqHeaders['cookie'] || '',
-          'bx-ua': reqHeaders['bx-ua'] || '',
-          'bx-umidtoken': reqHeaders['bx-umidtoken'] || '',
-          'bx-v': reqHeaders['bx-v'] || '',
-          'x-request-id': reqHeaders['x-request-id'] || '',
-          'user-agent': reqHeaders['user-agent'] || ''
-        };
-
-        console.log(`[Playwright] Headers from: ${request.url().substring(0, 60)}...`);
-        currentHeaders = extracted;
-        cachedQwenHeaders = { headers: extracted, chatSessionId: '', parentMessageId: null };
-        lastHeadersTime = Date.now();
-
-        await page.unroute('**/*', routeHandler);
-
-        try { await route.continue(); } catch {} // cleanup — continue may fail if request already handled
-        finish(extracted);
-      } catch (err) {
-        console.error('[Playwright] Route handler error:', err);
-        try { await route.continue(); } catch {} // cleanup — continue may fail if request already handled
-      }
-    };
-
-    page.route('**/*', routeHandler).then(async () => {
-      console.log('[Playwright] Navigating for header extraction...');
-      
-      const needsNav = forceNew || !page.url().includes('chat.qwen.ai');
-      if (needsNav) {
-        await page.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded' });
-      } else {
-        await page.reload({ waitUntil: 'domcontentloaded' });
-      }
-
-      const isLoginPage = page.url().includes('login') || !!(await page.$('input[type="email"]'));
-      if (isLoginPage) {
-        const email = process.env.QWEN_EMAIL;
-        const password = process.env.QWEN_PASSWORD;
-        if (email && password) {
-          console.log('[Playwright] Login page, auto-login...');
-          try {
-            const ok = await loginToQwen(email, password);
-            if (ok) {
-              await page.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded' });
-            }
-          } catch (err: any) {
-            console.error('[Playwright] Auto-login failed:', err.message);
-          }
-        } else {
-          console.warn('[Playwright] Login page but QWEN_EMAIL/PASSWORD not set');
-        }
-      }
-    });
-  });
+  // Generate new chat session
+  const chatSessionId = crypto.randomUUID();
+  
+  return {
+    headers,
+    chatSessionId,
+    parentMessageId: null
+  };
 }

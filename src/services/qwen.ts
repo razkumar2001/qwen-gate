@@ -177,7 +177,7 @@ export async function disablePersonalization(): Promise<void> {
     for (const email of accountsToProcess) {
       let settingsDebugId: string | null = null;
       try {
-        const { headers } = await getQwenHeaders(false, email);
+        const { headers } = await getQwenHeaders(email);
         const payload = {
           memory: {
             enable_memory: false,
@@ -342,7 +342,7 @@ export async function createQwenStream(
   parentId?: string | null,
   accountEmail?: string
 ): Promise<{ stream: ReadableStream, headers: Record<string, string>, uiSessionId: string, accountEmail?: string }> {
-  const { headers } = await getQwenHeaders(false);
+  const { headers } = await getQwenHeaders(accountEmail);
   const actualParentId: string | null = parentId !== undefined ? parentId : null;
   const timestamp = Math.floor(Date.now() / 1000);
   const fid = uuidv4();
@@ -416,7 +416,7 @@ export async function createQwenStream(
   let lastDebugEntryId: string | null = null;
 
   const makeRequest = async (): Promise<{ response: Response; headers: Record<string, string> }> => {
-    const { headers: reqHeaders } = await getQwenHeaders(false, currentAccountEmail);
+    const { headers: reqHeaders } = await getQwenHeaders(currentAccountEmail);
     const requestHeaders: Record<string, string> = {
       'accept': 'application/json',
       'accept-language': 'pt-BR,pt;q=0.9',

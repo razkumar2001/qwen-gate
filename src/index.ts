@@ -5,12 +5,19 @@ import { bearerAuth } from 'hono/bearer-auth';
 import { chatCompletions } from './routes/chat.ts';
 import { fetchQwenModels, disableNativeTools, disablePersonalization } from './services/qwen.ts';
 import * as dotenv from 'dotenv';
-import { initPlaywright, activePage, BrowserType, getQwenHeaders, closePlaywright } from './services/playwright.ts';
-import { initAuth, getAccountStats, getAccountCount, getAvailableCount } from './services/auth.ts';
+import { initPlaywright, BrowserType, getQwenHeaders, closePlaywright, getActivePage } from './services/playwright.ts';
+import { initAuth, getAccountStats, getAccountCount, getAvailableCount, reloadAccounts } from './services/auth.ts';
+import { sessionPool } from './services/sessionPool.ts';
 import { networkInterfaces } from 'os';
 import { resolve } from 'path';
 import { logStore } from './services/logStore.ts';
-import { logHtml } from './routes/logPage.ts';
+import { logHtml as logHtmlTemplate } from './routes/logPage.ts';
+
+// Inject API_KEY into dashboard HTML for client-side auth
+const logHtml = logHtmlTemplate.replace(
+  '<script>',
+  `<script>\nwindow.API_KEY = '${process.env.API_KEY || ''}';`
+);
 import { stream as honoStream } from 'hono/streaming';
 import { debugNetworkApp } from './routes/debugNetwork.ts';
 
@@ -85,12 +92,30 @@ app.use('/v1/*', async (c, next) => {
 app.use('/log*', async (c, next) => {
   const apiKey = process.env.API_KEY;
   if (!apiKey) return await next();
+  // SSE endpoint: EventSource cannot send custom headers, accept token as query param
+  if (c.req.path === '/log/stream') {
+    const token = c.req.query('token');
+    if (token === apiKey) return await next();
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+  if (c.req.path === '/log') return await next();
   return bearerAuth({ token: apiKey })(c, next);
+});
+
+app.get('/dashboard', async (c) => {
+  const apiKey = process.env.API_KEY;
+  if (apiKey) {
+    const authHeader = c.req.header('authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ') || authHeader.slice(7) !== apiKey) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+  }
+  return c.html(logHtml);
 });
 
 // Basic health check
 app.get('/health', (c) => {
-  const pwOk = activePage !== null;
+  const pwOk = getActivePage() !== null;
   return c.json({
     status: pwOk ? 'ok' : 'degraded',
     playwright: pwOk,
@@ -107,9 +132,57 @@ app.get('/accounts', (c) => {
   return c.json(getAccountStats());
 });
 
-// Log viewer — shows recent client inputs and Qwen outputs
+// Session pool stats — active sessions, waiting queue, etc.
+app.get('/pool/stats', (c) => {
+  return c.json(sessionPool.getStats());
+});
+
+app.post('/admin/accounts/reload', async (c) => {
+  const apiKey = process.env.API_KEY;
+  if (apiKey) {
+    const authHeader = c.req.header('authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ') || authHeader.slice(7) !== apiKey) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+  }
+  try {
+    await reloadAccounts();
+    const stats = getAccountStats();
+    return c.json({ success: true, accounts: stats.length });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return c.json({ error: message }, 500);
+  }
+});
+
+app.get('/system/logs', (c) => {
+  const apiKey = process.env.API_KEY;
+  if (apiKey) {
+    const authHeader = c.req.header('authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ') || authHeader.slice(7) !== apiKey) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+  }
+  const limit = parseInt(c.req.query('limit') || '100', 10);
+  const category = c.req.query('category');
+  const minLevel = c.req.query('level') as 'debug' | 'info' | 'warn' | 'error' | undefined;
+  return c.json(logStore.getSystemLogs({ limit, category, minLevel }));
+});
+
+app.get('/metrics/model-health', (c) => {
+  const apiKey = process.env.API_KEY;
+  if (apiKey) {
+    const authHeader = c.req.header('authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ') || authHeader.slice(7) !== apiKey) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+  }
+  return c.json(logStore.getAllModelHealth());
+});
+
+// Log viewer (legacy) — redirects to dashboard
 app.get('/log', (c) => {
-  return c.html(logHtml);
+  return c.redirect('/dashboard');
 });
 
 app.get('/log/json', (c) => {
@@ -182,11 +255,17 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     // Initialize auth AFTER playwright so login uses browser context with WAF headers.
     // The auth service will use activePage.evaluate() for the API call when available,
     // giving us proper anti-bot headers and avoiding WAF blocks.
-    initAuth().catch(err => console.warn('[Startup] initAuth failed:', err.message));
+    // MUST await initAuth before pre-warming to avoid race condition where
+    // AccountContext creation interferes with login flow.
+    try {
+      await initAuth();
+    } catch (err: any) {
+      console.warn('[Startup] initAuth failed:', err.message);
+    }
 
     console.log('[Startup] Pre-warming headers...');
     try {
-      await getQwenHeaders(true);
+      await getQwenHeaders();
       console.log('[Startup] Headers pre-warmed.');
     } catch (err: any) {
       console.warn('[Startup] Header pre-warm failed:', err.message);
@@ -221,5 +300,10 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   }).catch((err: any) => {
     console.error('Failed to initialize playwright:', err);
     process.exit(1);
+  });
+
+  // Expose uptime endpoint for dashboard
+  app.get('/metrics/uptime', (c) => {
+    return c.json({ uptimeSeconds: logStore.getUptimeSeconds() });
   });
 }

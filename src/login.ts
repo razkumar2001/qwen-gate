@@ -1,28 +1,32 @@
-import { initPlaywright, closePlaywright, activePage } from './services/playwright.ts';
+import { chromium } from 'playwright';
+import { closePlaywright } from './services/playwright.ts';
 import { saveCookies } from './services/auth.ts';
+import { getProfileDir } from './services/playwright.ts';
 import * as dotenv from 'dotenv';
 
 dotenv.config();
 
-async function main() {
-  const positionalEmail = process.argv.find((a, i) => i > 1 && !a.startsWith('--') && a.includes('@'));
-  const flagEmail = process.argv.find(a => a.startsWith('--email='))?.split('=')[1];
-  const email = positionalEmail || flagEmail;
-
-  if (!email) {
-    console.error('Usage: npm run login user@example.com');
-    console.error('       npm run login -- --email=user@example.com');
-    process.exit(1);
-  }
-
+/**
+ * Authenticate a user account via browser login flow.
+ * @param email - User email address for session labeling
+ * @returns Promise that resolves when session is saved
+ */
+export async function login(email: string): Promise<void> {
   console.log(`[Login] Logging in as ${email}`);
-  await initPlaywright(false);
-  if (!activePage) {
-    console.error('Failed to get active page');
-    process.exit(1);
-  }
+  
+  // Use persistent context so browser UI state (cookies, localStorage) survives across runs
+  const profileDir = getProfileDir(email);
+  console.log(`[Login] Using persistent profile: ${profileDir}`);
+  
+  const context = await chromium.launchPersistentContext(profileDir, {
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    viewport: { width: 1280, height: 800 },
+    headless: false,
+    args: ['--disable-blink-features=AutomationControlled'],
+  });
+  const page = await context.newPage();
 
-  await activePage.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded' });
+  await page.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded' });
   console.log('Browser opened. Please login to chat.qwen.ai.');
   console.log('Once you see the chat interface, press ENTER here to save the session.');
 
@@ -31,7 +35,7 @@ async function main() {
   });
 
   console.log('[Login] Extracting session data...');
-  const cookies = await activePage.context().cookies();
+  const cookies = await context.cookies();
   const tokenCookie = cookies.find(c => c.name === 'token');
   const refreshCookie = cookies.find(c => c.name === 'refresh_token');
 
@@ -45,8 +49,30 @@ async function main() {
   await saveCookies(email, tokenCookie.value, refreshCookie?.value || null);
   console.log(`[Login] Session saved for ${email}. You can now use this account.`);
   console.log('To add another account, run again: npm run login other@example.com');
-  await closePlaywright();
+  // Close persistent context (browser exits automatically)
+  await context.close();
+}
+
+// CLI entry point - backward compatible
+async function main() {
+  const positionalEmail = process.argv.find((a, i) => i > 1 && !a.startsWith('--') && a.includes('@'));
+  const flagEmail = process.argv.find(a => a.startsWith('--email='))?.split('=')[1];
+  const email = positionalEmail || flagEmail;
+
+  if (!email) {
+    console.error('Usage: npm run login user@example.com');
+    console.error('       npm run login -- --email=user@example.com');
+    process.exit(1);
+  }
+
+  await login(email);
   process.exit(0);
 }
 
-main();
+// Run main if executed directly (not imported)
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => {
+    console.error('[Login] Fatal error:', err);
+    process.exit(1);
+  });
+}
