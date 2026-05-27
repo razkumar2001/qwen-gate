@@ -82,6 +82,7 @@ export class ModelRouter {
     metrics.successes += 1;
     metrics.lastChecked = Date.now();
     this.modelHealth.set(model, metrics);
+    logStore.recordModelSuccess(model);
   }
 
   /**

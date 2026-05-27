@@ -2,6 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { getBasicHeaders, type BasicHeaders } from './playwright.ts';
 import { pickAccount, incrementInFlight, decrementInFlight, incrementTotalRequests, getAccountByEmail } from './auth.ts';
 import { createNetworkEntry, recordResponse, completeEntry, errorEntry } from './networkDebug.ts';
+import { logStore } from './logStore.js';
 
 interface PoolEntry {
   chatId: string;
@@ -79,6 +80,7 @@ export class SessionPool {
       this.activeCount++;
       const emailLabel = entry.accountEmail ? ` (${entry.accountEmail.split('@')[0]})` : '';
       console.log(`[SessionPool] Fresh session: ${chatId.substring(0, 8)}...${emailLabel}`);
+      logStore.log('info', 'pool', 'Session acquired' + (entry.accountEmail ? ': ' + entry.accountEmail.split('@')[0] : ''));
       return entry;
     } catch (err) {
       if (resolvedEmail) {
@@ -138,6 +140,7 @@ export class SessionPool {
     this.activeSessions.delete(chatId);
     if (this.activeCount > 0) this.activeCount--;
     this.deleteSession(chatId, cachedHeaders, accountEmail);
+    logStore.log('info', 'pool', 'Session released' + (accountEmail ? ': ' + accountEmail.split('@')[0] : ''));
   }
 
   async deleteSession(chatId: string, cachedHeaders?: { cookie: string; userAgent: string }, accountEmail?: string): Promise<void> {

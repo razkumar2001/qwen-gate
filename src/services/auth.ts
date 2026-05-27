@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import path from 'path';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, watch, type FSWatcher } from 'fs';
 import { getActivePage, getBrowser, createAccountContext } from './playwright.ts';
+import { logStore } from './logStore.js';
 
 const AUTH_FETCH_TIMEOUT_MS = parseInt(process.env.QWEN_FETCH_TIMEOUT_MS || '30000', 10);
 
@@ -674,7 +675,10 @@ async function loginFresh(email: string, password: string): Promise<AuthState | 
     const activePage = getActivePage();
     if (activePage) {
       const browserResult = await loginFreshViaBrowser(email, hashedPassword);
-      if (browserResult) return browserResult;
+      if (browserResult) {
+        logStore.log('info', 'auth', 'Login success: ' + email);
+        return browserResult;
+      }
       console.warn(`[Auth] Browser login failed for ${email}, trying temp context...`);
     }
 
@@ -682,13 +686,22 @@ async function loginFresh(email: string, password: string): Promise<AuthState | 
     const browser = getBrowser();
     if (browser) {
       const tempResult = await loginViaTempContext(browser, email, password);
-      if (tempResult) return tempResult;
+      if (tempResult) {
+        logStore.log('info', 'auth', 'Login success (temp context): ' + email);
+        return tempResult;
+      }
       console.warn(`[Auth] Temp context login failed for ${email}, trying fetch fallback...`);
     }
   }
 
   // Fetch fallback: for test mode or when all browser paths fail
-  return loginFreshViaFetch(email, hashedPassword);
+  const fetchResult = await loginFreshViaFetch(email, hashedPassword);
+  if (fetchResult) {
+    logStore.log('info', 'auth', 'Login success (fetch): ' + email);
+  } else {
+    logStore.log('error', 'auth', 'Login failed: ' + email);
+  }
+  return fetchResult;
 }
 
 // ─── Initialization ─────────────────────────────────────────────────────────────
@@ -747,6 +760,7 @@ export async function initAuth(): Promise<void> {
   // Report results
   const successCount = accounts.filter(a => a.state !== null && a.state.token).length;
   console.log(`[Auth] ${successCount}/${accounts.length} account(s) authenticated successfully.`);
+  logStore.log('info', 'auth', successCount + '/' + accounts.length + ' accounts authenticated');
   
   for (const acct of accounts) {
     const status = acct.state?.token ? '✓' : '✗';

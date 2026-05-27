@@ -297,6 +297,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       fetch: app.fetch,
       port
     });
+    logStore.log('info', 'server', 'Server started on port ' + port);
   }).catch((err: any) => {
     console.error('Failed to initialize playwright:', err);
     process.exit(1);

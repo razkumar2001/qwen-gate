@@ -69,43 +69,7 @@ const DEFAULT_MAX_CONCURRENCY = 10;
 const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
 const MAX_GUARD_RETRIES = 3;
 
-/** Default max execution loop turns (configurable via MAX_EXECUTION_TURNS env var).
- *  Lower values prevent runaway loops that degrade model attention.
- *  Default: 3 (was 10). */
-const DEFAULT_MAX_TURNS = (() => {
-  const envVal = process.env.MAX_EXECUTION_TURNS;
-  if (envVal !== undefined) {
-    const parsed = parseInt(envVal, 10);
-    if (!isNaN(parsed) && parsed > 0 && Number.isFinite(parsed)) {
-      return parsed;
-    }
-    console.warn(
-      `[executor] Invalid MAX_EXECUTION_TURNS="${envVal}", ` +
-      `must be a positive integer. Falling back to default 3.`
-    );
-  }
-  return 3;
-})();
 
-/** Default max cumulative tool calls per user request (configurable via MAX_TOOL_CALLS_PER_REQUEST env var).
- *  This is the HARD LIMIT across all loop turns — once reached, executor stops and returns.
- *  Default: 10. Setting higher increases risk of attention degradation/hallucination.
- *  Note: parser.ts also has MAX_TOOL_CALLS_PER_RESPONSE for per-chunk extraction safety.
- *  This executor-level limit is the final gate. */
-const DEFAULT_MAX_TOOL_CALLS_PER_REQUEST = (() => {
-  const envVal = process.env.MAX_TOOL_CALLS_PER_REQUEST;
-  if (envVal !== undefined) {
-    const parsed = parseInt(envVal, 10);
-    if (!isNaN(parsed) && parsed > 0 && Number.isFinite(parsed)) {
-      return parsed;
-    }
-    console.warn(
-      `[executor] Invalid MAX_TOOL_CALLS_PER_REQUEST="${envVal}", ` +
-      `must be a positive integer. Falling back to default 10.`
-    );
-  }
-  return 10;
-})();
 
 // ─── Content Parsing ───────────────────────────────────────────────────────────
 
@@ -413,24 +377,23 @@ export async function runExecutionLoop(
   model: string,
   config: ExecutionLoopConfig = {}
 ): Promise<string> {
-  const maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
   const debug = config.debug ?? false;
   const maxConcurrency = config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
   const toolTimeoutMs = config.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
-  const maxToolCallsPerRequest = config.maxToolCallsPerRequest ?? DEFAULT_MAX_TOOL_CALLS_PER_REQUEST;
-  let cumulativeToolCalls = 0;
 
   let consecutiveGuardFailures = 0;
   let lastGuardErrors = '';
   const toolCallWindow: string[] = [];
+  let turn = 0;
 
   const tools = registry.listNames().length > 0
     ? registry.toOpenAITools()
     : undefined;
 
-  for (let turn = 0; turn < maxTurns; turn++) {
+  while (true) {
+    turn++;
     if (debug) {
-      console.log(`[executor] Turn ${turn + 1}/${maxTurns}, messages: ${messages.length}`);
+      console.log(`[executor] Turn ${turn}, messages: ${messages.length}`);
     }
 
     const response = await sendToLLM(messages, tools, model);
@@ -493,7 +456,7 @@ export async function runExecutionLoop(
       }
 
       if (debug) {
-        console.log(`[executor] Turn ${turn+1}: tool call validation FAILED (attempt ${consecutiveGuardFailures}/${MAX_GUARD_RETRIES}):`, guardResult.errors);
+        console.log(`[executor] tool call validation FAILED (attempt ${consecutiveGuardFailures}/${MAX_GUARD_RETRIES}):`, guardResult.errors);
       }
 
       const escalation = [
@@ -508,25 +471,6 @@ export async function runExecutionLoop(
       continue;
     }
     consecutiveGuardFailures = 0;
-
-    // ── Cumulative Tool Call Limit Check ─────────────────────────────
-    // Hard stop: if we've hit the per-request tool call budget, exit now.
-    // This prevents runaway tool chains across multiple loop iterations.
-    cumulativeToolCalls += guardResult.valid.length;
-    
-    const remaining = maxToolCallsPerRequest - cumulativeToolCalls;
-    console.log(`[metrics] tool_calls=${cumulativeToolCalls} remaining=${remaining} limit=${maxToolCallsPerRequest}`);
-    
-    if (cumulativeToolCalls >= maxToolCallsPerRequest) {
-      if (debug) {
-        console.log(`[executor] Cumulative tool call limit reached (${cumulativeToolCalls}/${maxToolCallsPerRequest}), stopping loop`);
-      }
-      // Return any content we have, with a note that we hit the limit
-      const limitNote = effectiveContent
-        ? `${effectiveContent}\n\n[Note: Tool call limit reached (${cumulativeToolCalls}/${maxToolCallsPerRequest}).]`
-        : `[Tool call limit reached (${cumulativeToolCalls}/${maxToolCallsPerRequest}). Please refine your request or try a more focused approach.]`;
-      return limitNote;
-    }
 
     // ── Duplicate Detection ────────────────────────────────────────────
     for (const tc of guardResult.valid) {
@@ -566,10 +510,4 @@ export async function runExecutionLoop(
       messages.push(buildToolMessage(result));
     }
   }
-
-  // Max turns reached
-  if (debug) {
-    console.log(`[executor] Max turns (${maxTurns}) reached`);
-  }
-  return `[Execution loop reached maximum turns (${maxTurns}). Please provide a final response.]`;
 }

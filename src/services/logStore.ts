@@ -50,12 +50,12 @@ export interface LogEntry {
   request_id: string;
   latency_ms: number | null;
   tokens: { prompt: number; completion: number; total: number } | null;
-  input: string; // Sanitized prompt for display
-  rawRequestBody?: Record<string, unknown>; // Full OpenAI request body (model, messages, tools, etc.)
-  rawResponse: string; // Full raw response from Qwen (not truncated)
-  processedResponse: string; // After content filtering/tool parsing
-  error: string | null;
-  toolCalls: Array<{
+  input?: string; // Sanitized prompt for display
+  rawRequestBody?: Record<string, unknown> | string; // Full OpenAI request body
+  rawResponse?: string; // Full raw response from Qwen (not truncated)
+  processedResponse?: string; // After content filtering/tool parsing
+  error?: string | null;
+  toolCalls?: Array<{
     name: string;
     arguments: Record<string, unknown>;
     result?: unknown;
@@ -72,6 +72,35 @@ export interface LogEntry {
     firstByte: number;
     total: number;
   };
+  // Dashboard fields
+  clientRequest?: {
+    messageCount: number;
+    roles: string[];
+    hasTools: boolean;
+    toolNames: string[];
+    tool_choice: unknown | null;
+    lastMessage: string;
+    messages: Array<{ role: string; content: string }>;
+  };
+  promptToQwen?: {
+    systemPromptLength: number;
+    totalLength: number;
+    preview: string;
+  };
+  qwenRawChunks: string[];
+  rawFullContent: string;
+  toolCallResults?: unknown[];
+  parsedToolCalls: Array<{ name: string; args: string }>;
+  remainingText: string;
+  processedApiOutput: string;
+  finalResponse?: {
+    finishReason: string;
+    toolCallCount: number;
+    contentPreview: string;
+  };
+  errors: string[];
+  amplificationRatio?: number;
+  amplificationTriggeredInput?: string;
 }
 
 const MAX_ENTRIES = 100;
@@ -87,6 +116,7 @@ class LogStore {
   private persistencePath: string | null = null;
   private requestLogPath: string | null = null;
   private systemIdCounter = 0;
+  private serverStartTime = Date.now();
 
 
   enablePersistence(dirPath: string): void {
@@ -217,6 +247,7 @@ class LogStore {
         toolNames: [],
         tool_choice: null,
         lastMessage: '',
+        messages: [],
       },
       promptToQwen: {
         systemPromptLength: 0,
@@ -385,7 +416,7 @@ class LogStore {
       result[model] = {
         successCount: this.modelSuccessCounts.get(model) || 0,
         errorCount: this.modelErrorCounts.get(model) || 0,
-        lastActivity: this.modelHealthTimestamps.get(model) || '',
+        lastActivity: this.modelHealthTimestamps.get(model) ? new Date(this.modelHealthTimestamps.get(model)!).toISOString() : '',
       };
     }
     return result;
