@@ -69,7 +69,7 @@ body{font-family:var(--font);background:var(--bg-primary);color:var(--text-prima
 .panel-chevron{width:16px;height:16px;color:var(--text-secondary);transition:transform 0.25s ease}
 .panel-header.open .panel-chevron{transform:rotate(180deg)}
 .panel-body{max-height:0;overflow:hidden;transition:max-height 0.35s ease}
-.panel-body.open{max-height:4000px}
+.panel-body.open{max-height:99999px}
 .panel-content{padding:0 16px 16px}
 
 /* Tables */
@@ -89,6 +89,35 @@ tbody tr:hover{background:var(--bg-elevated)}
 .badge-neutral{background:var(--bg-elevated);color:var(--text-secondary)}
 .account-badge{background:var(--accent-soft);color:var(--accent);border:1px solid color-mix(in srgb,var(--accent) 30%,transparent)}
 
+/* Account Management */
+.account-mgmt-form{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.account-mgmt-input{flex:1;min-width:150px;padding:8px 12px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--radius);color:var(--text-primary);font-size:0.8125rem}
+.account-mgmt-input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+.account-mgmt-btn{padding:8px 16px;background:var(--accent);color:#fff;border:none;border-radius:var(--radius);font-size:0.8125rem;font-weight:500;cursor:pointer;transition:opacity 0.2s}
+.account-mgmt-btn:hover{opacity:0.9}
+.account-mgmt-btn.danger{background:var(--danger)}
+.account-mgmt-btn.success{background:var(--success)}
+.account-mgmt-btn.small{padding:4px 8px;font-size:0.75rem}
+.account-mgmt-actions{display:flex;gap:6px}
+.account-auth-status{display:flex;align-items:center;gap:6px}
+.account-auth-dot{width:8px;height:8px;border-radius:50%}
+.account-auth-dot.authenticated{background:var(--success)}
+.account-auth-dot.not-authenticated{background:var(--danger)}
+.account-mgmt-error{background:var(--danger-soft);color:var(--danger);padding:8px 12px;border-radius:var(--radius);font-size:0.8125rem;margin-bottom:12px;display:none}
+.account-mgmt-toast{position:fixed;bottom:20px;right:20px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--radius);padding:12px 16px;box-shadow:0 4px 12px rgba(0,0,0,0.3);z-index:1000;animation:slideIn 0.3s ease}
+.account-mgmt-toast.success{border-left:3px solid var(--success)}
+.account-mgmt-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2000;align-items:center;justify-content:center}
+.account-mgmt-modal{background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--radius);padding:24px;max-width:400px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.4)}
+.account-mgmt-modal h3{margin:0 0 8px;font-size:1rem}
+.account-mgmt-modal p{margin:0 0 20px;font-size:0.875rem;color:var(--text-secondary)}
+.account-mgmt-modal-actions{display:flex;gap:8px;justify-content:flex-end}
+.account-mgmt-modal-actions button{padding:8px 20px;border:none;border-radius:var(--radius);font-size:0.8125rem;cursor:pointer;font-weight:500}
+.account-mgmt-modal-cancel{background:var(--bg-base);color:var(--text-primary);border:1px solid var(--border)!important}
+.account-mgmt-modal-confirm{background:var(--danger);color:#fff}
+.account-mgmt-toast.error{border-left:3px solid var(--danger)}
+.account-mgmt-toast.warning{border-left:3px solid var(--warning)}
+@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+
 /* Session Pool Visual */
 .pool-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding-top:8px}
 .pool-stat{text-align:center;padding:12px;background:var(--bg-elevated);border-radius:8px}
@@ -107,6 +136,7 @@ tbody tr:hover{background:var(--bg-elevated)}
 .log-debug{color:#71717a}.log-info{color:#6366f1}.log-warn{color:#f59e0b}.log-error{color:#ef4444}
 
 /* Request Log / SSE Stream */
+#requestLogContainer{overflow-y:visible}
 .req-entry{border-bottom:1px solid var(--border);animation:fadeIn 0.3s ease}
 .req-entry:last-child{border-bottom:none}
 @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
@@ -119,6 +149,9 @@ tbody tr:hover{background:var(--bg-elevated)}
 .req-entry{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:12px;margin-bottom:8px}
 .req-block{background:var(--bg-elevated);border-radius:8px;padding:10px 12px;font-family:var(--mono);font-size:0.7rem;line-height:1.6;white-space:pre-wrap;word-break:break-all;color:var(--text-primary)}
 .req-block pre{margin:0;white-space:pre-wrap;word-break:break-all;font-family:var(--mono);font-size:0.7rem;line-height:1.6;color:var(--text-primary)}
+.load-more-btn{display:block;width:100%;padding:10px;margin:8px 0;background:var(--accent-soft);color:var(--accent);border:1px solid var(--accent);border-radius:8px;cursor:pointer;font-size:0.8125rem;font-weight:500;text-align:center;transition:all 0.2s}
+.load-more-btn:hover{background:var(--accent);color:var(--text-primary)}
+.load-more-btn:disabled{opacity:0.5;cursor:not-allowed}
 /* Per-message foldable content */
 .msg-header{cursor:pointer;user-select:none;display:inline-flex;align-items:center;gap:4px;padding:2px 0}
 .msg-header .fold-toggle{display:inline-block;transition:transform .2s;font-size:7px;margin-right:2px}
@@ -218,6 +251,40 @@ tbody tr:hover{background:var(--bg-elevated)}
               <tbody id="accountsBody"></tbody>
             </table>
             <div class="empty-state" id="accountsEmpty" style="display:none">No accounts registered</div>
+          </div>
+        </div>
+      </div>
+      <!-- Account Management -->
+      <div class="panel">
+        <div class="panel-header" onclick="togglePanel(this)">
+          <span>Account Management</span>
+          <span class="panel-toggle">▼</span>
+        </div>
+        <div class="panel-body open">
+          <div class="panel-content">
+            <div class="account-mgmt-error" id="accountMgmtError"></div>
+            <form class="account-mgmt-form" id="accountMgmtForm">
+              <input type="email" class="account-mgmt-input" id="accountEmailInput" placeholder="Email" required>
+              <input type="password" class="account-mgmt-input" id="accountPasswordInput" placeholder="Password" required>
+              <button type="submit" class="account-mgmt-btn">Add Account</button>
+            </form>
+            <div class="tbl-wrap">
+              <table id="accountMgmtTable">
+                <thead><tr><th>Email</th><th>Auth Status</th><th>Actions</th></tr></thead>
+                <tbody id="accountMgmtBody"></tbody>
+              </table>
+            </div>
+            <div class="empty-state" id="accountMgmtEmpty" style="display:none">No accounts registered</div>
+          </div>
+        </div>
+      </div>
+      <div id="accountMgmtConfirmOverlay" class="account-mgmt-overlay">
+        <div class="account-mgmt-modal">
+          <h3>Remove Account</h3>
+          <p>Are you sure you want to remove <strong id="accountMgmtConfirmEmail"></strong>?</p>
+          <div class="account-mgmt-modal-actions">
+            <button id="accountMgmtConfirmNo" class="account-mgmt-modal-cancel">Cancel</button>
+            <button id="accountMgmtConfirmYes" class="account-mgmt-modal-confirm">Remove</button>
           </div>
         </div>
       </div>
@@ -326,7 +393,9 @@ function toggleFold(header) {
 }
 
 /* ── State ── */
-var MAX_REQUEST_ENTRIES = 20;
+var MAX_REQUEST_ENTRIES = 500; // Match backend limit
+var RENDER_LIMIT_INITIAL = 50; // Show 50 entries initially
+var renderLimit = RENDER_LIMIT_INITIAL;
 var requestEntries = [];
 var requestEntryMap = {};
 
@@ -387,6 +456,160 @@ async function refreshAccounts() {
   }
   tbody.innerHTML = rows;
   setText('kpiTotalRequests', totalReqs);
+}
+
+/* ── Account Management ── */
+function showToast(message, type) {
+  var existing = document.querySelector('.account-mgmt-toast');
+  if (existing) existing.remove();
+  var toast = document.createElement('div');
+  toast.className = 'account-mgmt-toast ' + (type === 'success' ? 'success' : type === 'warning' ? 'warning' : 'error');
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  setTimeout(function() { toast.remove(); }, 3000);
+}
+
+async function renderAccountMgmt() {
+  var data = await apiFetch('/accounts');
+  var tbody = document.getElementById('accountMgmtBody');
+  var empty = document.getElementById('accountMgmtEmpty');
+  var table = document.getElementById('accountMgmtTable');
+  var errorDiv = document.getElementById('accountMgmtError');
+  
+  if (!data || !Array.isArray(data) || data.length === 0) {
+    table.style.display = 'none';
+    empty.style.display = '';
+    errorDiv.style.display = 'none';
+    return;
+  }
+  
+  table.style.display = '';
+  empty.style.display = 'none';
+  errorDiv.style.display = 'none';
+  
+  var rows = '';
+  for (var i = 0; i < data.length; i++) {
+    var a = data[i];
+    var authClass = a.authenticated ? 'authenticated' : 'not-authenticated';
+    var authText = a.authenticated ? 'Authenticated' : 'Not authenticated';
+    var loginStyle = a.authenticated ? ' style="display:none"' : '';
+    var loginLabel = a.authenticated ? '✓ Completed' : 'Login';
+    rows += '<tr>'
+      + '<td>' + escHtml(a.email) + '</td>'
+      + '<td><div class="account-auth-status"><div class="account-auth-dot ' + authClass + '"></div>' + authText + '</div></td>'
+      + '<td><div class="account-mgmt-actions">'
+      + '<button class="account-mgmt-btn small danger" data-email="' + escHtml(a.email) + '" data-action="remove">Remove</button>'
+      + '<button class="account-mgmt-btn small primary" data-email="' + escHtml(a.email) + '" data-action="login"' + loginStyle + '>' + loginLabel + '</button>'
+      + '</div></td></tr>';
+  }
+  tbody.innerHTML = rows;
+}
+
+async function handleAddAccount(email, password) {
+  var errorDiv = document.getElementById('accountMgmtError');
+  try {
+    var res = await fetch('/api/accounts', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+      body: JSON.stringify({ email: email, password: password })
+    });
+    var result = await res.json();
+    if (!res.ok || !result.success) {
+      throw new Error(result.message || 'Failed to add account');
+    }
+    if (result.loginSucceeded) {
+      showToast('Account added and logged in: ' + email, 'success');
+      pollUntilAuthenticated(email, 15);
+    } else {
+      showToast((result.loginError || 'Account added but login failed') + '. Click Login to open browser and log in manually.', 'warning');
+      pollUntilAuthenticated(email, 15);
+    }
+    errorDiv.style.display = 'none';
+    renderAccountMgmt();
+  } catch (e) {
+    errorDiv.textContent = e.message;
+    errorDiv.style.display = '';
+    showToast(e.message, 'error');
+  }
+}
+
+async function handleRemoveAccount(email) {
+  document.getElementById('accountMgmtConfirmEmail').textContent = email;
+  document.getElementById('accountMgmtConfirmOverlay').style.display = 'flex';
+  document.getElementById('accountMgmtConfirmYes').onclick = async function() {
+    document.getElementById('accountMgmtConfirmOverlay').style.display = 'none';
+    var errorDiv = document.getElementById('accountMgmtError');
+    try {
+      var res = await fetch('/api/accounts/' + encodeURIComponent(email), {
+        method: 'DELETE',
+        headers: authHeaders()
+      });
+      var result = await res.json();
+      if (!res.ok || !result.success) {
+        throw new Error(result.message || 'Failed to remove account');
+      }
+      showToast('Account removed: ' + email, 'success');
+      errorDiv.style.display = 'none';
+      renderAccountMgmt();
+    } catch (e) {
+      errorDiv.textContent = e.message;
+      errorDiv.style.display = '';
+      showToast(e.message, 'error');
+    }
+  };
+  document.getElementById('accountMgmtConfirmNo').onclick = function() {
+    document.getElementById('accountMgmtConfirmOverlay').style.display = 'none';
+  };
+}
+
+async function handleManualLogin(email) {
+  var errorDiv = document.getElementById('accountMgmtError');
+  var btn = document.querySelector('button[data-email="' + email.replace(/"/g, '&quot;') + '"][data-action="login"]');
+  if (btn) { btn.textContent = 'Opening browser...'; btn.disabled = true; }
+  try {
+    var res = await fetch('/api/accounts/' + encodeURIComponent(email) + '/autofill', {
+      method: 'GET',
+      headers: authHeaders()
+    });
+    var result = await res.json();
+    if (!res.ok || !result.success) {
+      throw new Error(result.message || 'Login failed');
+    }
+    if (btn) { btn.textContent = 'Browser open'; btn.disabled = false; }
+    showToast('Browser opened — log in manually. The session will be captured automatically.', 'warning');
+    errorDiv.style.display = 'none';
+    pollUntilAuthenticated(email, 30);
+  } catch (e) {
+    if (btn) { btn.textContent = 'Login'; btn.disabled = false; }
+    errorDiv.textContent = e.message;
+    errorDiv.style.display = '';
+    showToast(e.message, 'error');
+  }
+}
+
+function pollUntilAuthenticated(email, maxAttempts) {
+  var attempt = 0;
+  var timer = setInterval(async function() {
+    attempt++;
+    try {
+      var data = await apiFetch('/accounts');
+      if (!Array.isArray(data)) { clearInterval(timer); return; }
+      for (var i = 0; i < data.length; i++) {
+        if (data[i].email === email && data[i].authenticated) {
+          clearInterval(timer);
+          showToast('Login completed for ' + email, 'success');
+          renderAccountMgmt();
+          return;
+        }
+      }
+    } catch (e) {
+      clearInterval(timer);
+    }
+    if (attempt >= maxAttempts) {
+      clearInterval(timer);
+      renderAccountMgmt();
+    }
+  }, 2000);
 }
 
 /* ── Pool Stats ── */
@@ -558,6 +781,54 @@ function addRequestEntry(entry) {
     var old = requestEntries.shift();
     var el = document.getElementById(old);
     if (el) el.remove();
+    delete requestEntryMap[old.replace('req-', '')];
+  }
+  if (requestEntries.length > renderLimit) {
+    ensureLoadMoreButton(container);
+    hideExcessEntries();
+  }
+}
+
+function ensureLoadMoreButton(container) {
+  var existingBtn = document.getElementById('loadMoreBtn');
+  if (!existingBtn) {
+    var btn = document.createElement('button');
+    btn.id = 'loadMoreBtn';
+    btn.className = 'load-more-btn';
+    btn.textContent = 'Load More (' + (requestEntries.length - renderLimit) + ' hidden)';
+    btn.onclick = function() {
+      renderLimit += 50;
+      showEntriesUpTo(renderLimit);
+      updateLoadMoreButton();
+    };
+    container.appendChild(btn);
+  }
+}
+
+function hideExcessEntries() {
+  for (var i = renderLimit; i < requestEntries.length; i++) {
+    var el = document.getElementById(requestEntries[i]);
+    if (el) el.style.display = 'none';
+  }
+}
+
+function showEntriesUpTo(limit) {
+  for (var i = 0; i < Math.min(limit, requestEntries.length); i++) {
+    var el = document.getElementById(requestEntries[i]);
+    if (el) el.style.display = '';
+  }
+}
+
+function updateLoadMoreButton() {
+  var btn = document.getElementById('loadMoreBtn');
+  if (!btn) return;
+  var hidden = requestEntries.length - renderLimit;
+  if (hidden > 0) {
+    btn.textContent = 'Load More (' + hidden + ' hidden)';
+    btn.disabled = false;
+  } else {
+    btn.textContent = 'All entries loaded (' + requestEntries.length + ')';
+    btn.disabled = true;
   }
 }
 
@@ -588,7 +859,34 @@ function init() {
   refreshPool();
   refreshModelHealth();
   refreshSysLogs();
+  renderAccountMgmt();
   connectSSE();
+  
+  // Account Management form submit
+  var mgmtForm = document.getElementById('accountMgmtForm');
+  if (mgmtForm) {
+    mgmtForm.addEventListener('submit', function(e) {
+      e.preventDefault();
+      var email = document.getElementById('accountEmailInput').value;
+      var password = document.getElementById('accountPasswordInput').value;
+      handleAddAccount(email, password);
+      mgmtForm.reset();
+    });
+  }
+  
+  // Account Management button delegation (login/remove)
+  var mgmtTable = document.getElementById('accountMgmtTable');
+  if (mgmtTable) {
+    mgmtTable.addEventListener('click', function(e) {
+      var btn = e.target;
+      if (btn.tagName !== 'BUTTON') return;
+      var email = btn.getAttribute('data-email');
+      var action = btn.getAttribute('data-action');
+      if (!email || !action) return;
+      if (action === 'login') handleManualLogin(email);
+      else if (action === 'remove') handleRemoveAccount(email);
+    });
+  }
   
   // Polling fallback for SSE
   setInterval(() => {
@@ -597,6 +895,7 @@ function init() {
     refreshPool();
     refreshModelHealth();
     refreshSysLogs();
+    renderAccountMgmt();
   }, 2000);
 }
 if (document.readyState === 'loading') {
