@@ -9,9 +9,7 @@ coverage/
 .cache/
 .kilo
 qwen_profile/
-.obsidian-vault/.obsidian-vault/
 .omo
-.obsidian-vault
 .agent-screenshots
 TODO.md
 /graphify-out
@@ -20,3 +18,9 @@ TODO.md
 logs/
 output-problems/
 .backup
+.claude-flow
+.codeboarding
+
+# open-mem: Auto-generated folder context files.
+# Uncomment to exclude from version control (recommended for large projects):
+# **/AGENTS.md
