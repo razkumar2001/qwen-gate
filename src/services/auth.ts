@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import path from 'path';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, watch, type FSWatcher } from 'fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, rmSync, unlinkSync, watch, type FSWatcher } from 'fs';
 import { getActivePage, getBrowser, createAccountContext } from './playwright.ts';
 import { logStore } from './logStore.js';
 
@@ -117,7 +117,7 @@ function discoverSavedAccounts(): Array<{ email: string; password: string }> {
       const files = readdirSync(COOKIE_DIR).filter((f: string) => f.endsWith('.json'));
       for (const file of files) {
         try {
-          const data: SavedAccountData = JSON.parse(readFileSync(path.join(COOKIE_DIR, file), 'utf-8'));
+          const data: CookieData = JSON.parse(readFileSync(path.join(COOKIE_DIR, file), 'utf-8'));
           if (data.email && data.token) {
             diskAccounts.push({ email: data.email, password: '' });
           }
@@ -312,6 +312,7 @@ async function tryRefreshToken(acct: AccountEntry): Promise<boolean> {
           expiresAt: Date.now() + AUTH_TOKEN_MAX_AGE_MS,
           refreshToken: data.data.refresh_token || acct.state.refreshToken,
         };
+        await saveCookies(acct.email, acct.state.token, acct.state.refreshToken, acct.state.expiresAt);
         if (acct.throttledUntil > Date.now()) {
           console.log(`[Auth] ✓ Token refreshed for ${acct.email} — clearing throttle`);
           acct.throttledUntil = 0;
@@ -666,7 +667,7 @@ async function loginViaTempContext(
  * Login an account — uses browser-context API calls when Playwright is active,
  * falls back to plain fetch for test/no-browser mode.
  */
-async function loginFresh(email: string, password: string): Promise<AuthState | null> {
+export async function loginFresh(email: string, password: string): Promise<AuthState | null> {
   const hashedPassword = crypto.createHash('sha256').update(password).digest('hex');
   console.log(`[Auth] Logging in as ${email}...`);
 
@@ -710,15 +711,30 @@ export async function initAuth(): Promise<void> {
   if (initDone) return;
   initDone = true;
 
-  const saved = discoverSavedAccounts();
-  if (saved.length === 0) {
+  const persisted = loadAccountsFromFile();
+  const discovered = discoverSavedAccounts();
+
+  const merged = [...discovered];
+  for (const p of persisted) {
+    const existing = merged.find(a => a.email.toLowerCase().trim() === p.email.toLowerCase().trim());
+    if (existing) {
+      // Cookie-discovered accounts have no password — restore it from persisted file
+      if (p.password && !existing.password) {
+        existing.password = p.password;
+      }
+    } else if (p.password) {
+      merged.push(p);
+    }
+  }
+
+  if (merged.length === 0) {
     console.warn('[Auth] No saved accounts found. Run: npm run login user@example.com');
     return;
   }
 
-  console.log(`[Auth] Initializing ${saved.length} account(s)...`);
+  console.log(`[Auth] Initializing ${merged.length} account(s)...`);
 
-  accounts = saved.map((a: { email: string; password: string }) => ({
+  accounts = merged.map((a: { email: string; password: string }) => ({
     email: a.email,
     password: a.password,
     state: null,
@@ -834,21 +850,40 @@ export function getAllAccountEmails(): string[] {
   return accounts.map(a => a.email);
 }
 
+/**
+ * Get a readonly copy of all accounts with email and password.
+ * Passwords are included for admin/CRUD operations but should never be logged or returned to clients.
+ */
+export function getAccounts(): readonly AccountEntry[] {
+  return [...accounts];
+}
+
 // ─── Per-Account Cookie Store ───────────────────────────────────────────
 
 const COOKIE_DIR = 'qwen_profile/cookies';
+const ACCOUNTS_FILE = 'qwen_profile/accounts.json';
 
 function getCookieFilePath(email: string): string {
   const hash = crypto.createHash('md5').update(email.toLowerCase().trim()).digest('hex');
   return path.join(COOKIE_DIR, `${hash}.json`);
 }
 
-interface SavedAccountData {
+function getProfileDirForEmail(email: string): string {
+  const safe = email.toLowerCase().trim().replace(/[^a-z0-9]/g, '_');
+  return path.join(process.cwd(), 'qwen_profile', 'chromium-profiles', safe);
+}
+
+interface CookieData {
   email: string;
   token: string;
   refreshToken: string | null;
   savedAt: number;
   expiresAt: number;
+}
+
+interface PersistedAccountData {
+  email: string;
+  password: string;
 }
 
 /**
@@ -878,7 +913,7 @@ export async function loadSavedCookies(email: string): Promise<AuthState | null>
     if (!existsSync(filePath)) return null;
 
     const raw = readFileSync(filePath, 'utf-8');
-    const data: SavedAccountData = JSON.parse(raw);
+    const data: CookieData = JSON.parse(raw);
 
     if (!data.token || data.email.toLowerCase() !== email.toLowerCase()) return null;
 
@@ -924,7 +959,7 @@ export async function saveCookies(email: string, token: string, refreshToken?: s
       }
     }
 
-    const data: SavedAccountData = {
+    const data: CookieData = {
       email: email.toLowerCase().trim(),
       token,
       refreshToken: refreshToken || null,
@@ -1034,6 +1069,15 @@ export function setupAccountWatcher(): void {
 
     accountWatcher.on('error', (err) => {
       console.error(`[Auth] Account watcher error: ${err.message}`);
+      // Close the dead watcher so setupAccountWatcher() can re-create it
+      try { accountWatcher?.close(); } catch {}
+      accountWatcher = null;
+      watcherReady = false;
+      // Schedule restart in 10 seconds
+      setTimeout(() => {
+        console.log('[Auth] Attempting to restart account watcher...');
+        setupAccountWatcher();
+      }, 10000).unref();
     });
 
     console.log(`[Auth] Watching ${COOKIE_DIR} for account changes`);
@@ -1049,6 +1093,103 @@ export function setupAccountWatcher(): void {
  */
 export function enableHotReload(): void {
   setupAccountWatcher();
+}
+
+// ─── Account File Persistence ───────────────────────────────────────────────────
+
+
+
+function saveAccountsToFile(): void {
+  const dir = path.dirname(ACCOUNTS_FILE);
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
+  }
+  const data: PersistedAccountData[] = accounts
+    .filter(a => a.password)
+    .map(a => ({ email: a.email, password: a.password }));
+  writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2), 'utf-8');
+}
+
+function loadAccountsFromFile(): Array<{ email: string; password: string }> {
+  try {
+    if (!existsSync(ACCOUNTS_FILE)) {
+      return [];
+    }
+    const data: PersistedAccountData[] = JSON.parse(readFileSync(ACCOUNTS_FILE, 'utf-8'));
+    return data.filter(d => d.email && d.password);
+  } catch (err: any) {
+    console.error('[Auth] Failed to load accounts file:', err.message);
+    return [];
+  }
+}
+
+// ─── Account CRUD Operations ────────────────────────────────────────────────────
+
+export async function addAccount(email: string, password: string): Promise<{ loginSucceeded: boolean; loginError?: string }> {
+  const normalizedEmail = email.toLowerCase().trim();
+  const existing = accounts.find(a => a.email.toLowerCase().trim() === normalizedEmail);
+  if (existing) {
+    throw new Error(`Account with email ${normalizedEmail} already exists`);
+  }
+
+  const entry: AccountEntry = {
+    email: normalizedEmail,
+    password,
+    state: null,
+    lastUsed: 0,
+    throttledUntil: 0,
+    refreshInFlight: null,
+    loginAttempt: 0,
+    inFlight: 0,
+    totalRequests: 0,
+  };
+
+  accounts.push(entry);
+  saveAccountsToFile();
+
+  const newState = await loginFresh(normalizedEmail, password);
+  if (newState) {
+    entry.state = newState;
+    await saveCookies(normalizedEmail, newState.token, newState.refreshToken, newState.expiresAt);
+    console.log(`[Auth] Added and logged in: ${normalizedEmail}`);
+    return { loginSucceeded: true };
+  } else {
+    const msg = `Login failed: wrong password or CAPTCHA required for ${normalizedEmail}. Check system logs.`;
+    console.warn(`[Auth] ${msg}`);
+    return { loginSucceeded: false, loginError: msg };
+  }
+}
+
+export async function removeAccount(email: string): Promise<void> {
+  const normalizedEmail = email.toLowerCase().trim();
+  const index = accounts.findIndex(a => a.email.toLowerCase().trim() === normalizedEmail);
+  if (index === -1) {
+    throw new Error(`Account with email ${normalizedEmail} not found`);
+  }
+
+  accounts.splice(index, 1);
+  saveAccountsToFile();
+
+  const cookieFile = getCookieFilePath(normalizedEmail);
+  if (existsSync(cookieFile)) {
+    try {
+      unlinkSync(cookieFile);
+    } catch (err: any) {
+      console.error(`[Auth] Failed to delete cookie file for ${normalizedEmail}:`, err.message);
+    }
+  }
+
+  const profileDir = getProfileDirForEmail(normalizedEmail);
+  if (existsSync(profileDir)) {
+    try {
+      rmSync(profileDir, { recursive: true, force: true });
+      console.log(`[Auth] Deleted Chromium profile for ${normalizedEmail}`);
+    } catch (err: any) {
+      console.error(`[Auth] Failed to delete Chromium profile for ${normalizedEmail}:`, err.message);
+    }
+  }
+
+  console.log(`[Auth] Removed account: ${normalizedEmail}`);
 }
 
 // ─── Backward Compatibility ─────────────────────────────────────────────────────

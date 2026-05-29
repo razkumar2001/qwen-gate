@@ -118,6 +118,12 @@ export class SessionPool {
   }
 
   release(chatId: string, _newParentId: string | null, cachedHeaders?: { cookie: string; userAgent: string }, accountEmail?: string): void {
+    // Idempotency guard: if chatId not tracked as active, this session was already released.
+    // Prevents double-release from competing cleanup paths (setTimeout + finally).
+    if (!this.activeSessions.has(chatId)) {
+      return;
+    }
+
     // Track completed request — decrement in-flight, bump total count
     if (accountEmail) {
       decrementInFlight(accountEmail);
