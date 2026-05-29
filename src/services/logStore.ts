@@ -86,6 +86,12 @@ export interface LogEntry {
     systemPromptLength: number;
     totalLength: number;
     preview: string;
+    /** Estimated tokens in client's original messages (pre-inflation) */
+    clientTokens?: number;
+    /** Estimated tokens from content injected by qwen-gate (system prompt, formatting, tool instructions) */
+    overheadTokens?: number;
+    /** Total estimated tokens sent to Qwen (clientTokens + overheadTokens) */
+    estimatedTotalTokens?: number;
   };
   qwenRawChunks: string[];
   rawFullContent: string;
@@ -103,9 +109,10 @@ export interface LogEntry {
   amplificationTriggeredInput?: string;
 }
 
-const MAX_ENTRIES = 100;
-const MAX_CHUNKS_PER_ENTRY = 50;
-const MAX_SYSTEM_ENTRIES = 500;
+// Production-safe limits: 500 entries @ ~2KB avg = ~1MB memory, safe for long-running servers
+const MAX_ENTRIES = 500;
+const MAX_CHUNKS_PER_ENTRY = 100;
+const MAX_SYSTEM_ENTRIES = 1000;
 
 class LogStore {
   private entries: LogEntry[] = [];
