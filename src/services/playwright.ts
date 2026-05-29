@@ -1,4 +1,4 @@
-import { chromium, firefox, webkit, BrowserContext, Page, Cookie } from 'playwright';
+import { chromium, firefox, webkit, BrowserContext, Page, Cookie, Browser } from 'playwright';
 import path from 'path';
 import crypto from 'crypto';
 import { mkdirSync } from 'fs';
@@ -17,12 +17,12 @@ export interface AccountContext {
 }
 
 const accountContexts = new Map<string, AccountContext>();
+// Deduplicate concurrent createAccountContext calls for the same email.
+// Without this, two simultaneous requests for the same account create duplicate
+// BrowserContexts — wasting resources and corrupting cookie/header state.
+const contextCreationInFlight = new Map<string, Promise<AccountContext>>();
 let defaultBrowser: any = null; // Shared browser instance for creating contexts
 let initInFlight: Promise<void> | null = null;
-let cachedQwenHeaders: { headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null } | null = null;
-let lastHeadersTime = 0;
-const HEADERS_TTL = 5 * 60 * 1000;
-
 // P0: Cached values for getBasicHeaders() — avoids 2 async CDP calls per invocation
 let cachedUserAgent: string | null = null;
 let cachedCookies: string | null = null;
@@ -36,6 +36,29 @@ const COOKIE_REFRESH_INTERVAL = 30 * 1000;
 const CONTEXT_CLEANUP_TTL = 30 * 60 * 1000;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// SSRF prevention: validate URLs before passing to page.goto().
+// Blocks file://, localhost, private IPs, and empty/malformed URLs.
+function validateQwenUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`Invalid URL: ${url}`);
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error(`Blocked URL protocol: ${parsed.protocol}`);
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '0.0.0.0') {
+    throw new Error(`Blocked loopback URL: ${url}`);
+  }
+  if (/^10\.\d+\.\d+\.\d+$/.test(hostname) ||
+      /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/.test(hostname) ||
+      /^192\.168\.\d+\.\d+$/.test(hostname)) {
+    throw new Error(`Blocked private IP URL: ${url}`);
+  }
+}
 
 /**
  * Get persistent profile directory for an account.
@@ -254,10 +277,31 @@ export async function createAccountContext(email: string, cookies?: Record<strin
     };
   }
   
+  // Fast path: context already exists
+  const existing = accountContexts.get(email);
+  if (existing) return existing;
+
+  // Deduplicate concurrent creation: if another call is already creating
+  // a context for the same email, join that promise instead of creating a duplicate.
+  const inFlight = contextCreationInFlight.get(email);
+  if (inFlight) return inFlight;
+
+  const creationPromise = createContextInternal(email, cookies);
+  contextCreationInFlight.set(email, creationPromise);
+
+  try {
+    const ctx = await creationPromise;
+    return ctx;
+  } finally {
+    contextCreationInFlight.delete(email);
+  }
+}
+
+async function createContextInternal(email: string, cookies?: Record<string, string>): Promise<AccountContext> {
   await initPlaywright();
   if (!defaultBrowser) throw new Error('Playwright browser not initialized');
   
-  // Check if context already exists
+  // Double-check after init: another concurrent call may have created it while we waited
   if (accountContexts.has(email)) {
     return accountContexts.get(email)!;
   }
@@ -355,9 +399,10 @@ export async function refreshAccountCookies(email: string): Promise<void> {
     if (!hasAuthCookie) {
       // Context expired, need to navigate to refresh
       console.log(`[AccountContext] Context expired for ${email}, navigating to refresh`);
+      validateQwenUrl('https://chat.qwen.ai/');
       await page.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: 15000 });
       await sleep(2000);
-      
+
       // Re-check if we got an auth cookie after navigation
       const postCookies = await context.cookies();
       const hasPostAuth = postCookies.some(c => c.name.toLowerCase().includes('token') || c.name.toLowerCase().includes('session'));
@@ -398,6 +443,7 @@ async function checkValidSession(email: string): Promise<boolean> {
     const cookies = await accCtx.context.cookies();
     const hasAuthCookie = cookies.some(c => c.name.toLowerCase().includes('token') || c.name.toLowerCase().includes('session'));
     if (!hasAuthCookie) return false;
+    validateQwenUrl('https://chat.qwen.ai/');
     await accCtx.page.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: 10000 });
     const isLogged = !accCtx.page.url().includes('auth') && !accCtx.page.url().includes('login');
     return isLogged;
@@ -442,6 +488,10 @@ export async function closePlaywright() {
     await defaultBrowser.close();
     defaultBrowser = null;
   }
+  // Reset cached values so they are refetched on next getBasicHeaders() call
+  cachedUserAgent = null;
+  cachedCookies = null;
+  lastCookiesTime = 0;
   console.log('[AccountContext] All contexts closed');
 }
 
@@ -514,8 +564,9 @@ export async function loginToQwen(email: string, password: string): Promise<bool
   const page = getActivePage()!; // capture post-mutex — another caller could have closed it
 
   console.log(`[Playwright] Attempting API login for ${email}...`);
-  
+
   // Navigate to auth page to set up context/cookies
+  validateQwenUrl('https://chat.qwen.ai/auth');
   await page.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded' });
 
   // Qwen expects SHA256 hashed password
@@ -544,6 +595,7 @@ export async function loginToQwen(email: string, password: string): Promise<bool
   if (result.ok) {
     console.log('[Playwright] API login request successful.');
     // Navigate to home to confirm session
+    validateQwenUrl('https://chat.qwen.ai/');
     await page.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded' });
     const isLogged = !(page.url().includes('auth') || page.url().includes('login'));
     if (isLogged) {
@@ -560,14 +612,15 @@ export async function loginToQwen(email: string, password: string): Promise<bool
 }
 
 async function loginToQwenUI(email: string, password: string): Promise<boolean> {
-  if (!activePage) throw new Error('Playwright not initialized');
+  const page = getActivePage();
+  if (!page) throw new Error('Playwright not initialized');
 
   // Serialize: UI login mutates shared activePage + global cookie jar
   const release = await uiMutex.acquire();
   try {
-  const page = activePage; // capture post-mutex
 
   console.log('[Playwright] Attempting UI login...');
+  validateQwenUrl('https://chat.qwen.ai/auth');
   await page.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded' });
   await sleep(2000);
 
@@ -632,6 +685,140 @@ async function captureBxHeaders(accCtx: AccountContext): Promise<void> {
  * Get headers for a specific account or the best available account.
  * @param email Optional account email - if provided, use that account's context
  */
+export type LoginResult = 'success' | 'captcha' | 'closed' | 'error';
+
+export interface BrowserProfileOptions {
+  headless?: boolean;
+}
+
+export async function openBrowserProfile(email: string, password?: string, options?: BrowserProfileOptions): Promise<LoginResult> {
+  if (process.env.TEST_MOCK_PLAYWRIGHT) return 'success' as LoginResult;
+
+  const headless = options?.headless ?? false;
+  const profileDir = getProfileDir(email);
+  const mode = headless ? 'headless' : 'visible';
+  console.log(`[BrowserProfile] Opening persistent profile for ${email} (${mode}) at ${profileDir}`);
+
+  let context: any = null;
+  let page: any = null;
+
+  try {
+    context = await chromium.launchPersistentContext(profileDir, {
+      headless,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-blink-features=AutomationControlled',
+      ],
+    });
+
+    const existingCookies: Cookie[] = await context.cookies();
+    const existingToken = existingCookies.find((c: Cookie) => c.name === 'token');
+    if (existingToken && existingToken.expires && existingToken.expires * 1000 > Date.now()) {
+      console.log(`[BrowserProfile] ${email} already has valid token cookie in profile — skipping browser launch`);
+      await context.close();
+      return 'success';
+    }
+
+    page = context.pages()[0] || await context.newPage();
+
+    console.log('[BrowserProfile] Navigating to auth page...');
+    validateQwenUrl('https://chat.qwen.ai/auth');
+    await page.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    if (password) {
+      console.log('[BrowserProfile] Filling credentials...');
+      try {
+        await page.waitForSelector('input[type="email"], input[placeholder*="Email"], input[name="email"], input[name="login"]', { timeout: 8000 });
+        const emailInput = page.locator('input[type="email"], input[placeholder*="Email"], input[name="email"], input[name="login"]').first();
+        await emailInput.fill(email);
+
+        await page.waitForSelector('input[type="password"], input[name="password"]', { timeout: 5000 });
+        const passwordInput = page.locator('input[type="password"], input[name="password"]').first();
+        await passwordInput.fill(password);
+        console.log('[BrowserProfile] Credentials filled.');
+
+        try {
+          const submitBtn = page.locator('button[type="submit"], button:has-text("Sign in"), button:has-text("Login"), button:has-text("Log in")').first();
+          await submitBtn.click({ timeout: 3000 });
+          console.log('[BrowserProfile] Submit button clicked. Waiting for login...');
+        } catch {
+          console.log('[BrowserProfile] Could not auto-click submit — user may need to click manually.');
+        }
+      } catch {
+        console.log('[BrowserProfile] Could not find form fields — log in manually.');
+      }
+    } else {
+      console.log('[BrowserProfile] No password provided — user must log in manually.');
+    }
+
+    const maxAttempts = headless ? 15 : Infinity;
+    console.log(`[BrowserProfile] Polling for login (${headless ? 'headless, max 30s' : 'visible, close browser when done'}).`);
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      await sleep(2000);
+
+      try {
+        const cookies: Cookie[] = await context.cookies();
+        const tokenCookie = cookies.find((c: Cookie) => c.name === 'token');
+        if (tokenCookie) {
+          console.log('[BrowserProfile] Auth cookie detected!');
+          const { saveCookies } = await import('./auth.ts');
+          await saveCookies(email, tokenCookie.value);
+
+          console.log('[BrowserProfile] Login complete. Closing browser...');
+          try { await context.close(); } catch {}
+          return 'success';
+        }
+
+        if (attempt > 0 && attempt % 3 === 0) {
+          try {
+            const hasCaptcha = await page.evaluate(() => {
+              return !!(
+                document.querySelector('iframe[src*="recaptcha"]') ||
+                document.querySelector('iframe[src*="captcha"]') ||
+                document.querySelector('[class*="captcha"]') ||
+                document.querySelector('[id*="captcha"]') ||
+                document.querySelector('.captcha-container') ||
+                document.querySelector('[data-sitekey]') ||
+                document.querySelector('.g-recaptcha') ||
+                Array.from(document.querySelectorAll('iframe')).some(f =>
+                  /challenge|verify|captcha|recaptcha/i.test(f.src || '')
+                )
+              );
+            });
+            if (hasCaptcha) {
+              if (headless) {
+                console.log('[BrowserProfile] CAPTCHA detected in headless mode — closing browser, user must solve manually');
+                try { await context.close(); } catch {}
+                return 'captcha';
+              }
+              console.log('[BrowserProfile] CAPTCHA/verification challenge detected — keeping browser open for manual solving');
+            }
+          } catch {
+          }
+        }
+      } catch {
+        console.log('[BrowserProfile] Browser closed by user.');
+        try { await context.close(); } catch {}
+        return 'closed';
+      }
+    }
+
+    console.log('[BrowserProfile] Headless timeout — no login detected, closing browser');
+    try { await context.close(); } catch {}
+    return 'error';
+  } catch (err: any) {
+    console.error('[BrowserProfile] Error:', err.message);
+    if (context) { try { await context.close(); } catch {} }
+    return 'error';
+  }
+}
+
+export async function autoFillLogin(email: string, password: string): Promise<boolean> {
+  const result = await openBrowserProfile(email, password);
+  return result === 'success';
+}
+
 export async function getQwenHeaders(email?: string): Promise<{ headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null }> {
   if (process.env.TEST_MOCK_PLAYWRIGHT) {
     return {
@@ -645,9 +832,9 @@ export async function getQwenHeaders(email?: string): Promise<{ headers: Record<
       parentMessageId: null
     };
   }
-
+  
   await initPlaywright();
-
+  
   // Determine which account to use
   const targetEmail = email || pickAccount()?.email;
   if (!targetEmail) {
