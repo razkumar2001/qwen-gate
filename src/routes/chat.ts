@@ -8,7 +8,7 @@ import type { FunctionToolDefinition } from '../tools/types.ts';
 import { robustParseJSON } from '../utils/json.ts';
 import { StreamingToolParser } from '../tools/parser.ts';
 import { validateSingleToolCall } from '../tools/guard.ts';
-import { filterContent, stripToolCallArtifacts } from '../utils/contentFilter.ts';
+import { filterContent, stripToolCallArtifacts, stripStreamingDelta } from '../utils/contentFilter.ts';
 import { StreamingContentFilter } from './pipeline/StreamingContentFilter.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import modelSpecs from '../models.json' with { type: 'json' };
@@ -1078,7 +1078,7 @@ export async function chatCompletions(c: Context) {
                 // reclassifies early content and changes the prefix, we only emit what
                 // is genuinely new relative to the previous snapshot.
                 if (cleanedText && !pendingText) {
-                  const contentDelta = getSnapshotDelta(cleanedText, lastFilteredSnapshot);
+                  const contentDelta = stripStreamingDelta(getSnapshotDelta(cleanedText, lastFilteredSnapshot));
                   lastFilteredSnapshot = cleanedText;
                   if (contentDelta) {
                     if (!amplificationGuardTriggered) {
@@ -1148,12 +1148,12 @@ export async function chatCompletions(c: Context) {
                 // Only send text if all tool calls passed guard validation.
                 // If any failed, suppress the text to prevent polluting client context.
                 if (pendingText && allToolCallsValid && cleanedText) {
-                  const contentDelta = getSnapshotDelta(cleanedText, lastFilteredSnapshot);
-                  lastFilteredSnapshot = cleanedText;
-                  if (contentDelta) {
-                    if (!amplificationGuardTriggered) {
-                      const projectedRatio =
-                        (emittedOutputBytes + contentDelta.length) / Math.max(1, rawInputBytes);
+              const contentDelta = stripStreamingDelta(getSnapshotDelta(cleanedText, lastFilteredSnapshot));
+              lastFilteredSnapshot = cleanedText;
+              if (contentDelta) {
+                if (!amplificationGuardTriggered) {
+                  const projectedRatio =
+                    (emittedOutputBytes + contentDelta.length) / Math.max(1, rawInputBytes);
                       if (projectedRatio > 3 && emittedOutputBytes > 1000) {
                         amplificationGuardTriggered = true;
                         const ratio = Math.round(projectedRatio * 100) / 100;
@@ -1280,7 +1280,7 @@ export async function chatCompletions(c: Context) {
             lastFilteredSnapshot = flushCleaned;
           } else {
             lastFilteredSnapshot = flushCleaned;
-            const ct = contentDelta.replace(/[\n\s]*$/, '');
+            const ct = stripStreamingDelta(contentDelta).replace(/[\n\s]*$/, '');
             if (ct) {
               logStore.addProcessedOutput(logId, ct);
               emittedOutputBytes += ct.length;

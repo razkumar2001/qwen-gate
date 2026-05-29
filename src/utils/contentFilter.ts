@@ -261,6 +261,15 @@ export function stripToolCallArtifacts(text: string): string {
   // - end of text
   text = text.replace(/Tool Response \([^)]+\):[^\n]*(?:\n(?!\s*(?:\n|$)|Tool Response\s*\(|{"name)[^\n]*)*/g, '');
 
+  // ── Pass 2.5: Strip tool call interior fragments ──
+  // These appear when JSON splits across chunk boundaries during streaming
+  text = text.replace(/[a-z_][a-z_0-9]*(?:\.[a-z_][a-z_0-9]*)*"\s*,\s*"arguments"\s*:\s*\}/g, '');
+  text = text.replace(/"arguments"\s*:\s*\}/g, '');
+  text = text.replace(/"arguments"\s*:\s*\{\s*\}/g, '');
+  text = text.replace(/,\s*"arguments"\s*:/g, '');
+  text = text.replace(/"[a-z_]+(?:\.[a-z_]+)*"(?=\s*,\s*"arguments")/g, '');
+  text = text.replace(/read"\s*,\s*"arguments"\s*:\s*\}/g, '');
+
   // ── Pass 3: Strip trailing dangling tool call tails like `}]}}}` ──
   // These can appear when a tool call array gets partially rendered.
   text = text.replace(/^[\s]*[\]\}]+[\}\]\}]*\s*$/gm, '');
@@ -291,6 +300,16 @@ export function stripToolCallArtifacts(text: string): string {
   text = text.replace(/\n{3,}/g, '\n\n').trim();
 
   return text;
+}
+
+export function stripStreamingDelta(delta: string): string {
+  if (!delta) return '';
+  let cleaned = delta;
+  cleaned = cleaned.replace(/"arguments"\s*:\s*\}/g, '');
+  cleaned = cleaned.replace(/,\s*"arguments"\s*:/g, '');
+  cleaned = cleaned.replace(/"[a-z_]+(?:\.[a-z_]+)*"(?=\s*,\s*"arguments")/g, '');
+  cleaned = cleaned.replace(/Tool Response \([a-z_]+$/gm, '');
+  return cleaned;
 }
 
 /**

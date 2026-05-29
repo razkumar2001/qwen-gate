@@ -133,6 +133,7 @@ export class StreamingToolParser {
 
       if (jsonEnd === -1) {
         // Incomplete JSON — suppress and wait for more chunks
+        this.textEmissionBoundary = jsonStart;
         break;
       }
 
@@ -153,7 +154,7 @@ export class StreamingToolParser {
             }
           }
         } catch {
-          // Parse failed — treat as text
+          // Parse failed — drop the fragment, don't emit as text
         }
       }
 
@@ -408,6 +409,7 @@ export class StreamingToolParser {
         if (jsonEnd === -1) {
           // Incomplete JSON at end of stream — emit text before it, drop the JSON fragment
           result.text += remaining.substring(0, braceIdx);
+          this.textEmissionBoundary = this.buffer.length;
           remaining = '';
           break;
         }
@@ -436,7 +438,7 @@ export class StreamingToolParser {
         }
 
         // Not a tool call — skip past this JSON
-        result.text += remaining.substring(0, braceIdx + jsonEnd);
+        result.text += remaining.substring(0, braceIdx);
         remaining = remaining.substring(braceIdx + jsonEnd);
       }
 
