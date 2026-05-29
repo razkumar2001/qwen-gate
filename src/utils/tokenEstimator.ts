@@ -1,0 +1,196 @@
+/**
+ * Token estimation utilities for qwen-gate.
+ *
+ * Uses content-aware heuristics for fallback token counting when Qwen's API
+ * does not provide usage data. Used for:
+ *   1. Context window enforcement (pre-flight check)
+ *   2. Token overhead tracking (injected content vs original messages)
+ *   3. Fallback when Qwen's usage field is absent from SSE chunks
+ *
+ * IMPORTANT: These are estimates. Actual token counts come from Qwen's API
+ * response (chunk.usage.input_tokens / output_tokens). These heuristics
+ * are only used BEFORE Qwen responds and as fallback.
+ */
+
+// ─── Token Estimation ─────────────────────────────────────────────────────────
+
+/**
+ * Ratio: how many characters per token for different content types.
+ * These are empirically derived from Qwen model behavior.
+ *
+ * - English prose:           ~4.0  chars/token
+ * - Code / JSON:             ~2.5  chars/token  (dense punctuation, short tokens)
+ * - Chinese / CJK text:      ~1.5  chars/token  (each CJK char is ~1-2 tokens)
+ * - Mixed typical input:     ~3.5  chars/token  (old default, reasonable blend)
+ */
+const RATIO_PROSE = 4.0;
+const RATIO_CODE = 2.5;
+const RATIO_CJK = 1.5;
+const RATIO_DEFAULT = 3.5;
+
+/**
+ * Check if a character is CJK (Chinese / Japanese / Korean).
+ */
+function isCJK(char: string): boolean {
+  const cp = char.charCodeAt(0);
+  return (
+    (cp >= 0x4E00 && cp <= 0x9FFF) ||   // CJK Unified Ideographs
+    (cp >= 0x3400 && cp <= 0x4DBF) ||   // CJK Extension A
+    (cp >= 0x2E80 && cp <= 0x2EFF) ||   // CJK Radicals
+    (cp >= 0x3000 && cp <= 0x303F) ||   // CJK Symbols and Punctuation
+    (cp >= 0xFF00 && cp <= 0xFFEF) ||   // Fullwidth Forms
+    (cp >= 0xAC00 && cp <= 0xD7AF) ||   // Hangul Syllables
+    (cp >= 0x3040 && cp <= 0x309F) ||   // Hiragana
+    (cp >= 0x30A0 && cp <= 0x30FF)      // Katakana
+  );
+}
+
+/**
+ * Roughly classify a character for token estimation.
+ * - code-like: punctuation used heavily in code/JSON ({, }, [, ], :, ,, ;, =, <, >, etc.)
+ * - CJK characters count separately
+ * - Everything else is treated as prose
+ */
+function isCodeChar(char: string): boolean {
+  return /[{}[\]:";,=<>|+\-*/\\&%$#@!~^`]/.test(char);
+}
+
+/**
+ * Estimate token count from text using content-aware heuristics.
+ *
+ * Analyzes character distribution (CJK vs code-like vs prose) and applies
+ * different char-to-token ratios for each. Significantly more accurate
+ * than a flat `length / N` for mixed-language or code-heavy inputs.
+ */
+export function estimateTokens(text: string): number {
+  if (!text) return 0;
+
+  let cjkChars = 0;
+  let codeChars = 0;
+  let proseChars = 0;
+
+  for (const char of text) {
+    if (isCJK(char)) {
+      cjkChars++;
+    } else if (isCodeChar(char)) {
+      codeChars++;
+    } else {
+      proseChars++;
+    }
+  }
+
+  const cjkTokens = Math.ceil(cjkChars / RATIO_CJK);
+  const codeTokens = Math.ceil(codeChars / RATIO_CODE);
+  const proseTokens = Math.ceil(proseChars / RATIO_PROSE);
+
+  return cjkTokens + codeTokens + proseTokens;
+}
+
+/**
+ * Fast single-pass token estimate (less accurate but cheaper).
+ * Used when performance matters more than precision.
+ * Falls back to the original `length / 3.5` heuristic.
+ */
+export function estimateTokensFast(text: string): number {
+  if (!text) return 0;
+  return Math.ceil(text.length / RATIO_DEFAULT);
+}
+
+// ─── Overhead Tracking ────────────────────────────────────────────────────────
+
+export interface TokenBreakdown {
+  /** Token count of the user's original messages (pre-inflation) */
+  clientMessages: number;
+  /** Token count of content injected by qwen-gate (system prompts, formatting, tool instructions) */
+  injectedOverhead: number;
+  /** Total sent to Qwen (clientMessages + injectedOverhead) */
+  totalSent: number;
+}
+
+/**
+ * Calculate token breakdown between client messages and injected overhead.
+ *
+ * @param originalMessages - Concatenated text of the user's original messages
+ * @param finalPrompt - The full prompt sent to Qwen (after all injection)
+ */
+export function calculateTokenOverhead(
+  originalMessages: string,
+  finalPrompt: string,
+): TokenBreakdown {
+  const clientTokens = estimateTokens(originalMessages);
+  const totalTokens = estimateTokens(finalPrompt);
+
+  return {
+    clientMessages: clientTokens,
+    injectedOverhead: Math.max(0, totalTokens - clientTokens),
+    totalSent: totalTokens,
+  };
+}
+
+// ─── Context Window Validation ────────────────────────────────────────────────
+
+export interface ContextWindowCheck {
+  ok: boolean;
+  estimatedTotalTokens: number;
+  maxContext: number;
+  maxOutput: number;
+  availableTokens: number;
+  message: string | null;
+}
+
+/**
+ * Validate that the estimated token count fits within a model's context window.
+ *
+ * @param estimatedTokens - Estimated tokens for the prompt
+ * @param maxContext - Model's max context window (from models.json)
+ * @param maxOutput - Model's max output tokens
+ * @param modelName - Model name for error messaging
+ */
+export function checkContextWindow(
+  estimatedTokens: number,
+  maxContext: number,
+  maxOutput: number,
+  modelName: string,
+): ContextWindowCheck {
+  const availableTokens = maxContext - maxOutput;
+
+  if (estimatedTokens > maxContext) {
+    return {
+      ok: false,
+      estimatedTotalTokens: estimatedTokens,
+      maxContext,
+      maxOutput,
+      availableTokens,
+      message:
+        `Context window exceeded for model "${modelName}": ` +
+        `estimated ${estimatedTokens} prompt tokens exceeds ` +
+        `the model's ${maxContext} context window. ` +
+        `Reduce your prompt length or switch to a model with a larger context window.`,
+    };
+  }
+
+  if (estimatedTokens > availableTokens) {
+    return {
+      ok: false,
+      estimatedTotalTokens: estimatedTokens,
+      maxContext,
+      maxOutput,
+      availableTokens,
+      message:
+        `Prompt too long for model "${modelName}": ` +
+        `estimated ${estimatedTokens} prompt tokens leaves ` +
+        `only ${maxContext - estimatedTokens} tokens for the response, ` +
+        `but the model needs at least ${maxOutput} for max output. ` +
+        `Reduce your prompt or increase available context.`,
+    };
+  }
+
+  return {
+    ok: true,
+    estimatedTotalTokens: estimatedTokens,
+    maxContext,
+    maxOutput,
+    availableTokens,
+    message: null,
+  };
+}
