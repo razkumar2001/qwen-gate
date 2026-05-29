@@ -763,6 +763,14 @@ export async function chatCompletions(c: Context) {
     c.header('Connection', 'close');
 
     return honoStream(c, async (streamWriter: any) => {
+      let streamDone = false;
+      let clientDisconnected = false;
+      if (c.req.raw?.signal) {
+        c.req.raw.signal.addEventListener('abort', () => {
+          clientDisconnected = true;
+          streamDone = true;
+        });
+      }
       let heartbeatInterval: any;
       let totalChunks = 0;
       let streamReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -777,6 +785,7 @@ export async function chatCompletions(c: Context) {
           await streamWriter.write(': keep-alive\n\n');
         } catch (e) {
           clearInterval(heartbeatInterval);
+          streamDone = true;
         }
       }, 15000); // Every 15 seconds
       if (heartbeatInterval && typeof heartbeatInterval.unref === 'function') {
@@ -784,7 +793,13 @@ export async function chatCompletions(c: Context) {
       }
 
       const writeEvent = async (data: any) => {
-        await streamWriter.write(`data: ${JSON.stringify(data)}\n\n`);
+        if (clientDisconnected) return;
+        try {
+          await streamWriter.write(`data: ${JSON.stringify(data)}\n\n`);
+        } catch (e) {
+          streamDone = true;
+          throw e;
+        }
       };
 
       const makeChoice = (delta: any, finishReason: string | null = null) => ({
@@ -843,7 +858,6 @@ export async function chatCompletions(c: Context) {
       let buffer = '';
       let completionTokens = 0;
       let promptTokens = Math.ceil(finalPrompt.length / 3.5);
-      let streamDone = false;
 
       // Amplification guard: track raw input bytes vs emitted output bytes.
       // If emitted > raw*3 + 1000, suppress further text emission.
@@ -858,7 +872,13 @@ export async function chatCompletions(c: Context) {
         let done: boolean;
         let value: Uint8Array | undefined;
         try {
-          const readResult = await reader.read();
+          const IDLE_TIMEOUT_MS = 60_000;
+          const readResult = await Promise.race([
+            reader.read(),
+            new Promise<never>((_, reject) => {
+              setTimeout(() => reject(new Error('Upstream stream idle timeout — no data for 60s')), IDLE_TIMEOUT_MS);
+            })
+          ]);
           done = readResult.done;
           value = readResult.value;
         } catch (readErr: any) {
@@ -1391,8 +1411,8 @@ export async function chatCompletions(c: Context) {
       streamReleased = true;
       setTimeout(() => {
         clearInterval(_cleanupInterval);
-try { _cleanupReader.cancel(); } catch {} // cleanup — cancel may fail if reader already closed
-try { _cleanupReader.releaseLock(); } catch {} // cleanup — releaseLock may fail if already released
+        try { _cleanupReader.cancel(); } catch {} // cleanup — cancel may fail if reader already closed
+        try { _cleanupReader.releaseLock(); } catch {} // cleanup — releaseLock may fail if already released
         sessionPool.release(_cleanupChatId, _cleanupParentId, _cleanupHeaders, _cleanupEmail);
         // Persist raw vs processed output for debugging
         const entry = logStore.getRecent(1).find(e => e.id === logId);
