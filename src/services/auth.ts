@@ -521,9 +521,8 @@ async function loginFreshViaFetch(email: string, hashedPassword: string): Promis
       let refreshToken = data.data?.refresh_token || data.refresh_token || null;
 
       if (!token) {
-        const hdrs = response.headers as Headers & { getSetCookie?: () => string[] };
-        const setCookies: string[] = typeof hdrs.getSetCookie === 'function'
-          ? hdrs.getSetCookie()
+        const setCookies: string[] = typeof (response.headers as any).getSetCookie === 'function'
+          ? (response.headers as any).getSetCookie()
           : (response.headers.get('set-cookie') || '').split(',');
 
         for (const cookie of setCookies) {
