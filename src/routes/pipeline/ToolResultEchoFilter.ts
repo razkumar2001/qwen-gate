@@ -61,6 +61,30 @@ export class ToolResultEchoFilter {
   }
 
   /**
+   * Detect echo in text. Returns detection result with max similarity.
+   */
+  detectEcho(text: string): { blocked: boolean; similarity: number; reason: string } {
+    const lines = text.split('\n').filter(l => l.trim().length > 0);
+    if (lines.length === 0) return { blocked: false, similarity: 0, reason: '' };
+
+    let maxSimilarity = 0;
+    for (const line of lines) {
+      const normalized = this.normalizeLine(line);
+      if (normalized.length < MIN_LINE_LENGTH) continue;
+      const shingles = this.computeShingles(normalized);
+      for (const fp of this.fingerprints) {
+        const containment = this.shingleContainment(shingles, fp);
+        if (containment > maxSimilarity) maxSimilarity = containment;
+        if (containment >= JACCARD_THRESHOLD) {
+          return { blocked: true, similarity: containment, reason: `Echo detected (${(containment * 100).toFixed(1)}% similarity)` };
+        }
+      }
+    }
+
+    return { blocked: false, similarity: maxSimilarity, reason: '' };
+  }
+
+  /**
    * Return the fraction of lines that are echoes (0.0 to 1.0).
    * Used to detect heavy echo activity that warrants correction prompts.
    */

@@ -330,6 +330,14 @@ export async function fetchQwenModels(): Promise<any[]> {
   return cachedModels || [];
 }
 
+export interface QwenStreamResult {
+  stream: ReadableStream;
+  headers: Record<string, string>;
+  uiSessionId: string;
+  accountEmail?: string;
+  abortController: AbortController;
+}
+
 export async function createQwenStream(
   prompt: string, 
   enableThinking: boolean, 
@@ -337,7 +345,7 @@ export async function createQwenStream(
   chatId?: string,
   parentId?: string | null,
   accountEmail?: string
-): Promise<{ stream: ReadableStream, headers: Record<string, string>, uiSessionId: string, accountEmail?: string }> {
+): Promise<QwenStreamResult> {
   const { headers: _headers } = await getQwenHeaders(accountEmail);
   const actualParentId: string | null = parentId !== undefined ? parentId : null;
   const timestamp = Math.floor(Date.now() / 1000);
@@ -410,6 +418,7 @@ export async function createQwenStream(
   // Track which account is being used — passed to getQwenHeaders for token injection
   let currentAccountEmail = accountEmail;
   let lastDebugEntryId: string | null = null;
+  const streamAbortController = new AbortController();
 
   const makeRequest = async (): Promise<{ response: Response; headers: Record<string, string> }> => {
     const { headers: reqHeaders } = await getQwenHeaders(currentAccountEmail);
@@ -445,6 +454,16 @@ export async function createQwenStream(
     let response: Response;
     try {
       const { controller, cleanup } = createFetchTimeout();
+      controller.signal.addEventListener('abort', () => {
+        if (!streamAbortController.signal.aborted) {
+          streamAbortController.abort(controller.signal.reason || new Error('Fetch timeout'));
+        }
+      });
+      streamAbortController.signal.addEventListener('abort', () => {
+        if (!controller.signal.aborted) {
+          controller.abort(streamAbortController.signal.reason);
+        }
+      });
       try {
         response = await fetch(url, {
           method: 'POST',
@@ -584,5 +603,5 @@ export async function createQwenStream(
     })
   );
 
-  return { stream: wrappedStream, headers: result.headers, uiSessionId: chatId || '', accountEmail: currentAccountEmail };
+  return { stream: wrappedStream, headers: result.headers, uiSessionId: chatId || '', accountEmail: currentAccountEmail, abortController: streamAbortController };
 }

@@ -607,9 +607,11 @@ export async function chatCompletions(c: Context) {
     // Retry logic with exponential backoff for transient errors
     let stream: ReadableStream;
     let uiSessionId = session.chatId;
+    let qwenAbortController: AbortController | undefined;
     try {
-      const result = await createQwenStream(finalPrompt, isThinkingModel, routedModel, session.chatId, nextParentId, resolvedEmail);
-      stream = result.stream;
+const result = await createQwenStream(finalPrompt, isThinkingModel, routedModel, session.chatId, nextParentId, resolvedEmail);
+    stream = result.stream;
+    qwenAbortController = result.abortController;
       uiSessionId = result.uiSessionId;
       // Record success for health tracking
       modelRouter.recordSuccess(routedModel);
@@ -1262,6 +1264,47 @@ export async function chatCompletions(c: Context) {
                   ? filterContent(lastFullContent).thinking
                   : '';
                 const fullFilteredText = stripToolCallArtifacts(baseFilteredContent);
+
+                // Early echo detection BEFORE filtering — abort upstream to stop wasting tokens
+                // detectEcho is cheaper than filterText; if we're about to abort, skip the filter work
+                const echoDetection = toolEchoFilter.detectEcho(fullFilteredText);
+                if (echoDetection.blocked) {
+                  console.warn(`[EchoFilter] ${echoDetection.reason} — ABORTING UPSTREAM`);
+
+                  // Abort upstream fetch
+                  qwenAbortController.abort();
+
+                  // Cancel reader to stop consuming stream
+                  if (streamReader) {
+                    streamReader.cancel();
+                  }
+
+                  // Add correction for next turn
+                  const existing = pendingCorrections.get(session.chatId) || [];
+                  pendingCorrections.set(session.chatId, [
+                    ...existing,
+                    `[ECHO DETECTED] You repeated a tool result verbatim (${(echoDetection.similarity * 100).toFixed(1)}% similarity). ` +
+                    `Stop echoing tool results. Instead: (1) Analyze the result, (2) Take action based on it, or (3) Provide a summary/feedback. ` +
+                    `Do NOT copy tool output directly into your response.`
+                  ]);
+
+                  // Emit final chunk with stop reason
+                  await writeEvent({
+                    id: completionId,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: body.model,
+                    choices: [makeChoice({}, 'stop')]
+                  });
+                  await streamWriter.write('data: [DONE]\n\n');
+
+                  logStore.updateEntry(logId, entry => {
+                    entry.level = 'warn';
+                    entry.error = `Echo aborted: ${echoDetection.reason}`;
+                  });
+
+                  break;
+                }
 
                 // Apply echo filter to the full accumulated text (not per-chunk fragments).
                 // The shingle algorithm needs complete lines to detect echoes reliably;
