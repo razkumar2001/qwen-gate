@@ -6,12 +6,10 @@
  *   qg                    Start the gateway server
  *   qg login <email>      Authenticate account
  *   qg restart            Restart the gateway server
- *   qg ulw [on|off]       Toggle ultrawork mode
  *   qg --help             Show this help
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, writeFileSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { login as performLogin } from './login.js';
@@ -29,7 +27,6 @@ Usage:
   qg start              Start the gateway server
   qg login <email>      Authenticate a Qwen account via browser
   qg restart            Restart the gateway server
-  qg ulw [on|off]       Toggle ultrawork mode
   qg --help, -h         Show this help
 
 Server starts on http://localhost:${port}
@@ -78,29 +75,6 @@ async function restartServer() {
   await startServer();
 }
 
-async function toggleUltrawork(mode?: string) {
-  const configPath = resolve(process.env.HOME || process.env.USERPROFILE || '.', '.qwen-gate', '.env');
-  const enabled = mode !== 'off';
-  
-  if (existsSync(configPath)) {
-    let content = readFileSync(configPath, 'utf-8');
-    if (/^ULW_ENABLED=/m.test(content)) {
-      content = content.replace(/^ULW_ENABLED=.*/m, `ULW_ENABLED=${enabled}`);
-    } else {
-      content += (content.endsWith('\n') ? '' : '\n') + `ULW_ENABLED=${enabled}\n`;
-    }
-    writeFileSync(configPath, content);
-  } else {
-    // intentional: config file doesn't exist yet, will be created on first use
-  }
-  
-  if (enabled) {
-    // intentional: no-op when enabling, server will pick up config on restart
-  } else {
-    // intentional: no-op when disabling, server will pick up config on restart
-  }
-}
-
 async function main() {
   const args = process.argv.slice(2);
   
@@ -109,7 +83,7 @@ async function main() {
     process.exit(0);
   }
   
-  const [command, ...rest] = args;
+  const [command] = args;
   
   switch (command) {
     case 'login':
@@ -117,9 +91,6 @@ async function main() {
       break;
     case 'restart':
       await restartServer();
-      break;
-    case 'ulw':
-      await toggleUltrawork(rest[0]);
       break;
     case 'start':
     case 'run':
@@ -143,4 +114,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   });
 }
 
-export { startServer, handleLogin, restartServer, toggleUltrawork };
+export { startServer, handleLogin, restartServer };

@@ -23,8 +23,7 @@
     "test": "tsx --test src/**/*.test.ts",
     "qg": "tsx src/cli.ts",
     "qg:login": "tsx src/cli.ts login",
-    "qg:restart": "tsx src/cli.ts restart",
-    "qg:ulw": "tsx src/cli.ts ulw"
+    "qg:restart": "tsx src/cli.ts restart"
   },
   "keywords": [],
   "author": "Youssef Adel (test)",
