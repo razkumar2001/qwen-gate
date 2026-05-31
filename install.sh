@@ -50,6 +50,20 @@ else
   ok ".env already exists — skipping"
 fi
 
+# ── CLI symlink ────────────────────────────────────────────────────
+
+BIN_DIR="$HOME/.local/bin"
+mkdir -p "$BIN_DIR"
+chmod +x "$DIR/bin/qg"
+ln -sf "$(pwd)/$DIR/bin/qg" "$BIN_DIR/qg"
+
+if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+  printf '\n\033[1;33m⚠ %s is not in your PATH\033[0m\n' "$BIN_DIR"
+  printf '  Add this to your shell profile:\n'
+  printf '  \033[1mexport PATH="%s:$PATH"\033[0m\n\n' "$BIN_DIR"
+fi
+ok "CLI installed as 'qg' (symlink → $BIN_DIR/qg)"
+
 # ── Done ───────────────────────────────────────────────────────────
 
 PORT=$(grep -E '^\s*PORT=' "$DIR/.env" | head -1 | cut -d= -f2 | tr -d ' ')
@@ -58,7 +72,9 @@ PORT="${PORT:-26405}"
 printf '\n\033[1;32m╔══════════════════════════════════════════════╗\033[0m\n'
 printf '\033[1;32m║       Qwen Gate installed successfully      ║\033[0m\n'
 printf '\033[1;32m╚══════════════════════════════════════════════╝\033[0m\n\n'
-printf '  Start:   \033[1mcd %s && npm start\033[0m\n' "$DIR"
-printf '  API:     http://localhost:%s/v1\n' "$PORT"
+printf '  Start:     \033[1mqg\033[0m\n'
+printf '  Login:     \033[1mqg login <email>\033[0m\n'
+printf '  Restart:   \033[1mqg restart\033[0m\n'
+printf '  API:       http://localhost:%s/v1\n' "$PORT"
 printf '  Dashboard: http://localhost:%s/log\n' "$PORT"
 printf '\n'

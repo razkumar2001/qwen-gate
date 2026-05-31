@@ -4,7 +4,9 @@
   "description": "OpenAI-compatible API gateway for Qwen models",
   "main": "index.js",
   "bin": {
-    "qg": "./dist/cli.js"
+    "qg": "./bin/qg",
+    "qwengate": "./bin/qg",
+    "qwen-gate": "./bin/qg"
   },
   "scripts": {
     "postinstall": "node scripts/setup.js || exit 0",

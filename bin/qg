@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# qg — Qwen Gate CLI entry point
+# Resolves to the project root and delegates to src/cli.ts via tsx
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+exec npx tsx "$PROJECT_ROOT/src/cli.ts" "$@"
