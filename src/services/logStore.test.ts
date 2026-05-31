@@ -32,6 +32,7 @@ test('logStore createEntry emits valid JSON with required structured fields', ()
     toolNames: [],
     tool_choice: null,
     lastMessage: '',
+    messages: [],
   });
 });
 
