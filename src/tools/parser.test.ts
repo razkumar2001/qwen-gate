@@ -4,45 +4,78 @@ import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { StreamingToolParser } from './parser.ts';
 
+function streamChunks(text: string): string[] {
+  const tokens = text.match(/\S+\s*/g) || [];
+  const chunks: string[] = [];
+  const pattern = [2, 4, 3, 5, 2];
+  let i = 0, pi = 0;
+  while (i < tokens.length) {
+    const size = Math.min(pattern[pi % pattern.length], tokens.length - i);
+    chunks.push(tokens.slice(i, i + size).join(''));
+    i += size;
+    pi++;
+  }
+  return chunks;
+}
+
 describe('StreamingToolParser flush leak vector', () => {
   it('S1: flush drops non-tool-call JSON instead of emitting as text', () => {
     const parser = new StreamingToolParser();
-    // Feed text containing a JSON object that is NOT a tool call
-    // (no "name" + "arguments"/"function"/"parameters" pattern)
-    const feedResult = parser.feed('Some text {"random": "json"} more text');
+    const chunks = streamChunks('Some text {"random": "json"} more text');
+    let allText = '';
+    let allToolCalls: any[] = [];
+    for (const chunk of chunks) {
+      const r = parser.feed(chunk);
+      allText += r.text;
+      allToolCalls.push(...r.toolCalls);
+    }
     const flushResult = parser.flush();
-    
-    // Accumulate text from both feed() and flush() since text is emitted incrementally
-    const allText = feedResult.text + flushResult.text;
-    
+    allText += flushResult.text;
+    allToolCalls.push(...flushResult.toolCalls);
+
     // The JSON should be DROPPED, not emitted as text
-    // Text should contain only the parts before/after the JSON
-    assert.ok(!allText.includes('"random"'), 
+    assert.ok(!allText.includes('"random"'),
       `Non-tool-call JSON leaked as text: "${allText}"`);
-    assert.ok(!allText.includes('"json"'), 
+    assert.ok(!allText.includes('"json"'),
       `Non-tool-call JSON value leaked as text: "${allText}"`);
-    // Text before/after JSON should be preserved
-    assert.ok(allText.includes('Some text'), 
+    assert.ok(allText.includes('Some text'),
       `Text before JSON lost: "${allText}"`);
-    assert.ok(allText.includes('more text'), 
+    assert.ok(allText.includes('more text'),
       `Text after JSON lost: "${allText}"`);
-    assert.strictEqual(feedResult.toolCalls.length + flushResult.toolCalls.length, 0);
+    assert.strictEqual(allToolCalls.length, 0);
   });
 
   it('S2: flush drops JSON with name but no arguments as non-tool-call', () => {
     const parser = new StreamingToolParser();
-    const feedResult = parser.feed('prefix {"not_a_tool":true,"random_field":42} suffix');
-    const flushResult = parser.flush();
-    
-    const allText = feedResult.text + flushResult.text;
-    
-    assert.ok(!allText.includes('"not_a_tool"'), 
-      `Non-tool JSON leaked as text: "${allText}"`);
-    assert.ok(!allText.includes('"random_field"'), 
-      `Non-tool JSON leaked as text: "${allText}"`);
-    assert.ok(allText.includes('prefix'), `prefix lost: "${allText}"`);
-    assert.ok(allText.includes('suffix'), `suffix lost: "${allText}"`);
-    assert.strictEqual(feedResult.toolCalls.length + flushResult.toolCalls.length, 0);
+    const chunks = streamChunks('{"name": "search", "query": "hello"}');
+    let allText = '';
+    let allToolCalls: any[] = [];
+    for (const chunk of chunks) {
+      const r = parser.feed(chunk);
+      allText += r.text;
+      allToolCalls.push(...r.toolCalls);
+    }
+    const flush = parser.flush();
+    allText += flush.text;
+    allToolCalls.push(...flush.toolCalls);
+    assert.strictEqual(allToolCalls.length, 0,
+      `Should not extract JSON without arguments: ${JSON.stringify(allToolCalls)}`);
+    assert.ok(!allText.includes('"search"'),
+      `Tool name leaked as text: "${allText}"`);
+  });
+
+  it('S3: JSON with name+function key extracted with empty arguments', () => {
+    const parser = new StreamingToolParser();
+    const feed = parser.feed('{"name": "search", "function": "hello"}');
+    const flush = parser.flush();
+    const allText = feed.text + flush.text;
+    const allCalls = [...feed.toolCalls, ...flush.toolCalls];
+    assert.strictEqual(allCalls.length, 1,
+      `Expected 1 tool call with empty args: ${JSON.stringify(allCalls)}`);
+    assert.strictEqual(allCalls[0].name, 'search');
+    assert.deepStrictEqual(allCalls[0].arguments, {});
+    assert.ok(!allText.includes('"search"'),
+      `Tool name leaked as text: "${allText}"`);
   });
 
   it('S3: malformed JSON between valid tool calls does not drop subsequent ones', () => {
