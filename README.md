@@ -20,6 +20,13 @@ OpenAI-compatible API gateway for **Qwen models (chat.qwen.ai)** using Playwrigh
 ## Quick Start
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/youssefvdel/qwen-gate/main/install.sh | bash
+cd qwen-gate && npm start
+```
+
+Or manually:
+
+```bash
 git clone https://github.com/youssefvdel/qwen-gate.git
 cd qwen-gate
 npm install
