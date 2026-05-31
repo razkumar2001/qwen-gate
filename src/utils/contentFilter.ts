@@ -124,6 +124,9 @@ export function filterContent(raw: string): FilterResult {
   text = cleanParagraphs.join('\n\n');
   text = text.replace(/\n{3,}/g, '\n\n');
 
+  // ── Pass 2.5: Strip leaked system instruction markers ──
+  text = text.replace(/\[READ TOOL RESULT below[^\]]*\]\s*/g, '');
+
   // ── Pass 3: Strip any remaining tool call JSON and Tool Response echoes ──
   text = stripToolCallArtifacts(text);
 
@@ -294,6 +297,7 @@ export function stripStreamingDelta(delta: string): string {
   if (!delta) return '';
   let cleaned = delta;
 
+  cleaned = cleaned.replace(/\[READ TOOL RESULT below[^\]]*\]\s*/g, '');
   cleaned = cleaned.replace(/<tool_result[^>]*>[\s\S]*?<\/tool_result>/g, '');
   cleaned = cleaned.replace(/<\/tool_result>/g, '');
   cleaned = cleaned.replace(/\n?<tool(?:_[a-z]*)?$/g, '');
