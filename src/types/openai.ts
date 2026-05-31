@@ -5,8 +5,6 @@
  * Single source of truth for all message, tool, and response types.
  */
 
-// ─── JSON Schema ───────────────────────────────────────────────────────────────
-
 export interface JsonSchema {
   type?: string | string[];
   properties?: Record<string, JsonSchema>;
@@ -47,8 +45,6 @@ export interface JsonSchema {
   examples?: unknown[];
 }
 
-// ─── Function Tool Definitions ─────────────────────────────────────────────────
-
 export interface FunctionToolDefinition {
   type: 'function';
   function: {
@@ -60,16 +56,12 @@ export interface FunctionToolDefinition {
   inputSchema?: JsonSchema;
 }
 
-// ─── Tool Choice ───────────────────────────────────────────────────────────────
-
 export type ToolChoice =
   | 'auto'
   | 'none'
   | 'required'
   | 'any'
   | { type: 'function'; function: { name: string } };
-
-// ─── Messages ──────────────────────────────────────────────────────────────────
 
 export interface ToolCallFunction {
   name: string;
@@ -91,8 +83,6 @@ export interface Message {
   reasoning_content?: string;
 }
 
-// ─── Request ───────────────────────────────────────────────────────────────────
-
 export interface OpenAIRequest {
   model: string;
   messages: Message[];
@@ -103,8 +93,6 @@ export interface OpenAIRequest {
     include_usage?: boolean;
   };
 }
-
-// ─── Streaming Response ────────────────────────────────────────────────────────
 
 export interface ToolCallDelta {
   index: number;
@@ -153,23 +141,17 @@ export interface ChatCompletionChunk {
   usage?: Usage;
 }
 
-// ─── Parsed Tool Call (from LLM) ───────────────────────────────────────────────
-
 export interface ParsedToolCall {
   id: string;
   name: string;
   arguments: unknown;
 }
 
-// ─── Model Specification ──────────────────────────────────────────────────────
-
 export interface ModelSpec {
   max_context: number;
   max_output: number;
   modalities: string[];
 }
-
-// ─── Tool Call Result ──────────────────────────────────────────────────────────
 
 export interface ToolCallResult {
   toolCallId: string;
@@ -178,14 +160,10 @@ export interface ToolCallResult {
   isError: boolean;
 }
 
-// ─── Tool Handler ──────────────────────────────────────────────────────────────
-
 export type ToolHandler<TArgs = any, TResult = any> = (
   args: TArgs,
   context: ToolContext
 ) => Promise<TResult>;
-
-// ─── Tool Context ──────────────────────────────────────────────────────────────
 
 export interface ToolContext {
   /** The original messages from the request */
@@ -198,8 +176,6 @@ export interface ToolContext {
   [key: string]: any;
 }
 
-// ─── Tool Registration ─────────────────────────────────────────────────────────
-
 export interface ToolRegistration {
   name: string;
   description: string;
@@ -208,8 +184,6 @@ export interface ToolRegistration {
   handler: ToolHandler;
   policy?: ToolPolicy;
 }
-
-// ─── Tool Policy ───────────────────────────────────────────────────────────────
 
 export interface ToolPolicy {
   maxCallsPerRun?: number;

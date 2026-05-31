@@ -28,7 +28,7 @@ async function getFreePort(startPort: number): Promise<number> {
 test('Concurrent chat requests check for "chat is in progress"', async () => {
   const port = await getFreePort(3100);
   const server = serve({ fetch: app.fetch, port });
-  console.log(`[ConcurrentTest] Server started on port ${port}`);
+
 
   await initPlaywright(true);
 
@@ -39,7 +39,7 @@ test('Concurrent chat requests check for "chat is in progress"', async () => {
       stream: false
     };
 
-    console.log('[ConcurrentTest] Sending 2 requests concurrently...');
+
     
     // Dispara duas requisições simultaneamente para simular concorrência na mesma sessão
     const p1 = fetch(`http://localhost:${port}/v1/chat/completions`, {
@@ -59,8 +59,8 @@ test('Concurrent chat requests check for "chat is in progress"', async () => {
     const data1 = await res1.json();
     const data2 = await res2.json();
 
-    console.log('[ConcurrentTest] Result 1:', res1.status, JSON.stringify(data1).substring(0, 200));
-    console.log('[ConcurrentTest] Result 2:', res2.status, JSON.stringify(data2).substring(0, 200));
+
+
 
     // Se a concorrência não estiver sendo tratada, um deles pode falhar com o erro "in progress"
     assert.strictEqual(res1.status, 200, `Request 1 failed: ${JSON.stringify(data1)}`);

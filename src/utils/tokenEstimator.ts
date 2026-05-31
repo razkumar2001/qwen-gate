@@ -17,8 +17,6 @@
  * for representative prompts; adjust RATIO_* constants if error > 15%.
  */
 
-// ─── Token Estimation ─────────────────────────────────────────────────────────
-
 /**
  * Ratio: how many characters per token for different content types.
  * These are empirically derived from Qwen model behavior.
@@ -130,8 +128,6 @@ export function estimateTokensFast(
   return estimate;
 }
 
-// ─── Overhead Tracking ────────────────────────────────────────────────────────
-
 export interface TokenBreakdown {
   /** Token count of the user's original messages (pre-inflation) */
   clientMessages: number;
@@ -160,8 +156,6 @@ export function calculateTokenOverhead(
     totalSent: totalTokens,
   };
 }
-
-// ─── Context Window Validation ────────────────────────────────────────────────
 
 export interface ContextWindowCheck {
   ok: boolean;

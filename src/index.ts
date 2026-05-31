@@ -50,10 +50,9 @@ const logHtml = logHtmlTemplate.replace(
   '<script>',
   `<script>\nwindow.API_KEY = '${escapeJSString(process.env.API_KEY || '')}';`
 );
-import { stream as honoStream } from 'hono/streaming';
 import { debugNetworkApp } from './routes/debugNetwork.ts';
 
-dotenv.config();
+dotenv.config({ path: resolve(process.cwd(), '.env') });
 
 export const app = new Hono();
 
@@ -74,15 +73,15 @@ app.use('*', async (c, next) => {
   }
 });
 
-async function gracefulShutdown(signal: string): Promise<void> {
+async function gracefulShutdown(_signal: string): Promise<void> {
   if (isShuttingDown) {
-    console.log(`[Shutdown] ${signal} received again, forcing exit...`);
     process.exit(1);
   }
   isShuttingDown = true;
-  console.log(`\n[Shutdown] ${signal} received, in-flight: ${inFlightRequests}`);
   if (serverInstance) {
-    try { (serverInstance as any).close?.(); } catch {}
+    try { (serverInstance as any).close?.(); } catch {
+      // intentional: server close failure during shutdown is non-blocking, continue cleanup
+    }
   }
   if (inFlightRequests > 0) {
     const start = Date.now();
@@ -258,18 +257,21 @@ app.get('/log/stream', (c) => {
           if (!safeEnqueue(`data: ${JSON.stringify(entry)}\n\n`)) {
             unsub();
             clearInterval(heartbeat);
-            try { controller.close(); } catch {}
+            try { controller.close(); } catch {
+              // intentional: stream close failure during abort is non-blocking, connection already lost
+            }
           }
         });
 
-        // Cleanup on client disconnect
         const signal = c.req.raw?.signal;
         if (signal) {
           signal.addEventListener('abort', () => {
             alive = false;
             unsub();
             clearInterval(heartbeat);
-            try { controller.close(); } catch {}
+            try { controller.close(); } catch {
+              // intentional: stream close failure during abort is non-blocking, connection already lost
+            }
           });
         }
       },
@@ -323,7 +325,6 @@ app.get('/v1/models', async (c) => {
 import { fileURLToPath } from 'url';
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  // Parse browser type from args or env
   let browserType: BrowserType = 'chromium';
   const browserArg = process.argv.find(arg => arg.startsWith('--browser='));
   if (browserArg) {
@@ -335,26 +336,61 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   // Enable log persistence — writes system logs and request-level raw/processed logs to disk
   logStore.enablePersistence(resolve(process.cwd(), 'logs'));
 
-  initPlaywright(true, browserType).then(async () => {
-    console.log(`Playwright initialized (${browserType}).`);
+  const port = parseInt(process.env.PORT || '26405', 10) || 26405;
+  console.log(`📌 PORT from .env: ${process.env.PORT || '(not set — using default 26405)'}`);
 
-    // Initialize auth AFTER playwright so login uses browser context with WAF headers.
-    // The auth service will use activePage.evaluate() for the API call when available,
-    // giving us proper anti-bot headers and avoiding WAF blocks.
-    // MUST await initAuth before pre-warming to avoid race condition where
-    // AccountContext creation interferes with login flow.
+  initPlaywright(true, browserType).then(async () => {
+    serverInstance = serve({
+      fetch: app.fetch,
+      port,
+      serverOptions: {
+        requestTimeout: 600_000,
+        keepAliveTimeout: 75_000,
+        headersTimeout: 65_000,
+      },
+    });
+    logStore.log('info', 'server', 'Server started on port ' + port);
+    console.log(`🚀 Server listening on http://localhost:${port}`);
+
+    console.log('⏳ Authenticating accounts in background...');
     try {
       await initAuth();
     } catch (err: any) {
       console.warn('[Startup] initAuth failed:', err.message);
     }
 
+    const accountStats = getAccountStats();
+    const totalAccounts = accountStats.length;
+    const authenticatedAccounts = accountStats.filter(a => a.authenticated).length;
+    const throttledAccounts = accountStats.filter(a => a.throttled).length;
+
+    console.log('');
+    console.log('═══════════════════════════════════════════════════════');
+    console.log('  🔐 Account Status');
+    console.log('═══════════════════════════════════════════════════════');
+    if (totalAccounts === 0) {
+      console.log('  ⚠️  No accounts loaded. Add accounts via /accounts or accounts.json');
+    } else {
+      console.log(`  📊 Total: ${totalAccounts} | ✅ Authenticated: ${authenticatedAccounts} | ❌ Not authed: ${totalAccounts - authenticatedAccounts} | ⏸ Throttled: ${throttledAccounts}`);
+      console.log('  ───────────────────────────────────────────────────');
+      for (const acct of accountStats) {
+        const status = acct.authenticated
+          ? (acct.throttled ? `⏸ throttled (${Math.ceil(acct.throttledRemainingMs / 1000)}s)` : '✅ ready')
+          : '❌ not authenticated';
+        const expiresIn = acct.authenticated
+          ? ` | token: ${Math.ceil(acct.tokenExpiresInMs / 60000)}min`
+          : '';
+        const reqs = acct.totalRequests > 0 ? ` | reqs: ${acct.totalRequests}` : '';
+        console.log(`  ${acct.authenticated ? '●' : '○'} ${acct.email}  —  ${status}${expiresIn}${reqs}`);
+      }
+    }
+    console.log('═══════════════════════════════════════════════════════');
+    console.log('');
+
     startAutoCleanup();
 
-    console.log('[Startup] Pre-warming headers...');
     try {
       await getQwenHeaders();
-      console.log('[Startup] Headers pre-warmed.');
     } catch (err: any) {
       console.warn('[Startup] Header pre-warm failed:', err.message);
     }
@@ -364,33 +400,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       disablePersonalization().catch(err => console.warn('[Startup] disablePersonalization failed:', err.message)),
     ]);
 
-    const port = parseInt(process.env.PORT || '26405', 10) || 26405;
-    
-    const networkIP = getNetworkAddress();
-    
-    console.log('\n🚀 Qwen Gate started!');
-    console.log(`- Local:   http://localhost${port === 80 ? '' : ':' + port}`);
-    console.log(`- Alias:   http://qwen-gate`);
-    if (networkIP) {
-      console.log(`- Network: http://${networkIP}${port === 80 ? '' : ':' + port}`);
-    }
-
-    console.log('\nAvailable Routes:');
-    app.routes.forEach(route => {
-      console.log(`- [${route.method}] ${route.path}`);
-    });
-    console.log('');
-
-    serverInstance = serve({
-      fetch: app.fetch,
-      port,
-      serverOptions: {
-        requestTimeout: 600_000,      // 10 minutes — SSE streams can run long
-        keepAliveTimeout: 75_000,     // 75 seconds
-        headersTimeout: 65_000,       // 65 seconds (must be < requestTimeout)
-      },
-    });
-    logStore.log('info', 'server', 'Server started on port ' + port);
+    console.log('✅ Background initialization complete');
   }).catch((err: any) => {
     console.error('Failed to initialize playwright:', err);
     process.exit(1);

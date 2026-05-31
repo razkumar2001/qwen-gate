@@ -111,7 +111,6 @@ export async function disableNativeTools(): Promise<void> {
           image_search: false
         }
       };
-      console.log('[Qwen] Disabling native tools...');
       const settingsHeaders: Record<string, string> = {
         'accept': 'application/json, text/plain, */*',
         'accept-language': 'pt-BR,pt;q=0.9',
@@ -151,7 +150,6 @@ export async function disableNativeTools(): Promise<void> {
         console.error(`[Qwen] Failed to disable native tools: ${response.status} - ${text}`);
         completeEntry(settingsDebugId);
       } else {
-        console.log('[Qwen] Native tools disabled successfully.');
         nativeToolsDisabled = true;
         completeEntry(settingsDebugId);
       }
@@ -191,7 +189,6 @@ export async function disablePersonalization(): Promise<void> {
             'image-generation': false,
           },
         };
-        console.log(`[Qwen] Disabling personalization for ${email}...`);
         const settingsHeaders: Record<string, string> = {
           'accept': 'application/json, text/plain, */*',
           'accept-language': 'pt-BR,pt;q=0.9',
@@ -230,7 +227,6 @@ export async function disablePersonalization(): Promise<void> {
           const text = await response.text();
           console.error(`[Qwen] Failed to disable personalization for ${email}: ${response.status} - ${text}`);
         } else {
-          console.log(`[Qwen] Personalization disabled for ${email}.`);
         }
         completeEntry(settingsDebugId);
       } catch (err: any) {
@@ -342,7 +338,7 @@ export async function createQwenStream(
   parentId?: string | null,
   accountEmail?: string
 ): Promise<{ stream: ReadableStream, headers: Record<string, string>, uiSessionId: string, accountEmail?: string }> {
-  const { headers } = await getQwenHeaders(accountEmail);
+  const { headers: _headers } = await getQwenHeaders(accountEmail);
   const actualParentId: string | null = parentId !== undefined ? parentId : null;
   const timestamp = Math.floor(Date.now() / 1000);
   const fid = uuidv4();
@@ -496,7 +492,6 @@ export async function createQwenStream(
               // Rotate to next available account for retry
               const nextAccount = pickAccount();
               if (nextAccount && nextAccount.email !== currentAccountEmail) {
-                console.log(`[Qwen] Rate limited on ${currentAccountEmail}, rotating to ${nextAccount.email}`);
                 currentAccountEmail = nextAccount.email;
               }
             }

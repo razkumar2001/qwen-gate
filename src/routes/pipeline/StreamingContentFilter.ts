@@ -16,8 +16,7 @@
  *     // emit any remaining content
  */
 
-import { filterContent, stripToolCallArtifacts } from '../../utils/contentFilter.ts';
-import type { FilterResult } from '../../utils/contentFilter.ts';
+import { filterContent, stripToolCallArtifacts, type FilterResult } from "../../utils/contentFilter.ts";
 
 export interface StreamFilterResult {
   /** New clean content delta since last feed() call */
@@ -137,7 +136,6 @@ export class StreamingContentFilter {
     // If current is a prefix of previous (shouldn't happen normally), no delta
     if (i === current.length) return '';
 
-    // Return everything after the common prefix
     return current.substring(i);
   }
 }

@@ -36,11 +36,11 @@ accountsRouter.post('/', async (c) => {
     openBrowserProfile(email.toLowerCase().trim(), password, { headless: true })
       .then(loginResult => {
         if (loginResult === 'success') {
-          console.log(`[Accounts] Persistent browser login completed for ${email}`);
+          // intentional: success is already reflected in addAccount result, no additional action needed
         } else if (loginResult === 'captcha') {
-          console.log(`[Accounts] CAPTCHA detected for ${email} — click Login in dashboard to solve manually`);
+          // intentional: CAPTCHA requires manual intervention, user must complete login via CLI
         } else if (loginResult === 'closed') {
-          console.log(`[Accounts] Browser closed by user for ${email}`);
+          // intentional: browser closed before login completed, user must retry
         }
       })
       .catch(err => {
@@ -120,15 +120,14 @@ accountsRouter.get('/:email/autofill', async (c) => {
       return c.json({ success: true, email: account.email, message: 'Account is already authenticated.' });
     }
 
-    console.log(`[Accounts] Opening browser for login: ${email}`);
     openBrowserProfile(account.email, account.password, { headless: false })
       .then(loginResult => {
         if (loginResult === 'success') {
-          console.log(`[Accounts] Login completed for ${email}`);
+          // intentional: success is already reflected in token save, no additional action needed
         } else if (loginResult === 'captcha') {
-          console.log(`[Accounts] CAPTCHA detected for ${email} — browser left open`);
+          // intentional: CAPTCHA requires manual intervention, user must complete login in browser
         } else if (loginResult === 'closed') {
-          console.log(`[Accounts] Browser closed by user for ${email}`);
+          // intentional: browser closed before login completed, user must retry
         }
       })
       .catch(err => {

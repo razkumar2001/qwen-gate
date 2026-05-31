@@ -1,5 +1,3 @@
-import { setTimeout } from 'node:timers/promises';
-
 const BASE_URL = process.env.BASE_URL || 'http://localhost:26405';
 const CONCURRENCY = parseInt(process.env.CONCURRENCY || '10', 10);
 const REQUESTS = parseInt(process.env.REQUESTS || '100', 10);
@@ -9,7 +7,7 @@ let completed = 0;
 let errors = 0;
 let latencies: number[] = [];
 
-async function makeRequest(id: number): Promise<void> {
+async function makeRequest(_id: number): Promise<void> {
   const start = Date.now();
   try {
     const res = await fetch(`${BASE_URL}${ENDPOINT}`, {
@@ -24,7 +22,7 @@ async function makeRequest(id: number): Promise<void> {
     const latency = Date.now() - start;
     latencies.push(latency);
     if (!res.ok) errors++;
-  } catch (e) {
+  } catch (_e) {
     errors++;
   } finally {
     completed++;

@@ -45,35 +45,23 @@ function isThinkingLine(line: string): boolean {
 const QWEN_THINK_TAG_PATTERN = /<\/?(?:think|thinking|thought|tool_call|tool_use|function_call|tool)(?:\s[^>]{0,100})?\/?>/gi;
 const QWEN_THINK_BLOCK_START = /<(?:think(?:ing)?|thought|tool_call|tool_use|function_call|tool)[\s>]/i;
 
-/**
- * Filters content to remove thinking/reasoning text and XML tags.
- * Captures thinking text for use as reasoning_content.
- * 
- * Strategy:
- * 1. First pass: strip all XML tags (<think>, </think>, etc.) and capture content between them as thinking
- * 2. Second pass: line-by-line check for thinking patterns in remaining text
- * 3. Multi-line thinking block detection: if 2+ consecutive lines are thinking, and they form a coherent block, capture all
- */
 export function filterContent(raw: string): FilterResult {
   if (!raw) return { cleanText: '', thinking: '' };
 
   let text = raw;
   const capturedThinking: string[] = [];
 
-  // ── Pass 1: Extract content from XML think blocks ──────────────────
-  // Handle <think>content</think> and <thinking>content</thinking>
   while (true) {
     const startMatch = text.match(QWEN_THINK_BLOCK_START);
     if (!startMatch) break;
-    
+
     const startIdx = startMatch.index!;
     const startTagEnd = text.indexOf('>', startIdx) + 1;
-    
-    // Find matching end tag
+
     const endTagName = text.substring(startIdx + 1, text.indexOf('>', startIdx));
     const endPattern = new RegExp(`</${endTagName.replace(/[\s>].*/, '')}>`, 'i');
     const endMatch = text.substring(startTagEnd).match(endPattern);
-    
+
     if (endMatch) {
       const endIdx = startTagEnd + endMatch.index!;
       const thinkContent = text.substring(startTagEnd, endIdx);
@@ -115,7 +103,7 @@ export function filterContent(raw: string): FilterResult {
       /^\$\s/.test(l) ||            // Shell commands
       /^[|+-]{2,}/.test(l) ||       // Table borders
       /^\|.*\|/.test(l) ||          // Table rows
-      /^[\[{"]/.test(l) ||          // JSON/array start
+      /^[[{"]/.test(l) ||          // JSON/array start
       /^[✓✗✔✘✅❌]/.test(l) ||      // Checkboxes
       /^[A-Z][a-z]+ [a-z]+:/.test(l) // "Tool Status:" etc
     );
@@ -167,7 +155,6 @@ export function stripToolCallArtifacts(text: string): string {
       break;
     }
 
-    // Emit text before the potential tool call
     result += remaining.substring(0, toolCallStart);
 
     // Find the opening brace for scanning
@@ -250,15 +237,29 @@ export function stripToolCallArtifacts(text: string): string {
 
   text = result;
 
-  // ── Pass 2: Strip "Tool Response (name): ..." echoes ────────────────
-  // Model may echo back the tool result that was in the prompt.
-  // These lines start with "Tool Response (toolName):" and contain the
-  // tool result from the message history, which the client already has.
-  // The continuation captures multi-line content until:
-  // - a blank line (paragraph break)
-  // - another "Tool Response" starting
-  // - a tool call JSON `{"name...` starting
-  // - end of text
+  text = text.replace(/<tool_result[^>]*>[\s\S]*?<\/tool_result>/g, '');
+
+  const unmatchedOpenIdx = text.search(/<tool_result(?:\s[^>]*)?>/);
+  if (unmatchedOpenIdx !== -1) {
+    text = text.substring(0, unmatchedOpenIdx);
+  }
+
+  // ── Pass 2b: Strip orphaned closing </tool_result> tags ────────────
+  text = text.replace(/<\/tool_result\s*>/g, '');
+
+  // ── Pass 2c: Strip partial/incomplete opening <tool_result tag at EOL ─
+  // Catches streaming fragments like "<tool_resul", "<tool_result", "<tool_result name="bash"
+  text = text.replace(/\n?<tool_result(?:\s[^>]*)?$/g, '');
+  text = text.replace(/\n?<tool_res(?:ult?)?(?:\s[^>]*)?$/g, '');
+  text = text.replace(/\n?<tool_re(?:s(?:ult?)?)?(?:\s[^>]*)?$/g, '');
+  text = text.replace(/\n?<tool_?(?:re(?:s(?:ult?)?)?)?(?:\s[^>]*)?$/g, '');
+  text = text.replace(/\n?<tool(?:\s[^>]*)?$/g, '');
+  text = text.replace(/\n?<to(?:ol?)?$/g, '');
+  text = text.replace(/\n?<t?$/g, '');
+
+  // ── Pass 2d: Strip legacy "Tool Response (name): ..." echoes ───────
+  // Backwards compatibility: if old-format tool responses leak through,
+  // strip them too. Same regex as before.
   text = text.replace(/Tool Response \([^)]+\):[^\n]*(?:\n(?!\s*(?:\n|$)|Tool Response\s*\(|{"name)[^\n]*)*/g, '');
 
   // ── Pass 2.5: Strip tool call interior fragments ──
@@ -276,7 +277,7 @@ export function stripToolCallArtifacts(text: string): string {
 
   // ── Pass 3: Strip trailing dangling tool call tails like `}]}}}` ──
   // These can appear when a tool call array gets partially rendered.
-  text = text.replace(/^[\s]*[\]\}]+[\}\]\}]*\s*$/gm, '');
+  text = text.replace(/^[\s]*[\]}]+[}\]}]*\s*$/gm, '');
 
   // ── Pass 4: Strip tool-usage echo from output ───────────────────────
   // When the model describes what tool it's calling or what a tool returned,
@@ -285,22 +286,6 @@ export function stripToolCallArtifacts(text: string): string {
   // window with information nobody needs to see twice.
   text = stripToolEcho(text);
 
-  // ── Pass 5: Strip any remaining XML-like tool wrapper tags ─────────
-  // Safety net: if the model ever outputs ,>,
-  // <tool_call>, or similar XML wrappers despite instructions, strip them
-  // completely (including content between matching tags).
-  const XML_TOOL_PATTERNS = [
-    /<function_calls>[\s\S]*?<\/function_calls>/gi,
-    /<tool_call>[\s\S]*?<\/tool_call>/gi,
-    /<tool_use>[\s\S]*?<\/tool_use>/gi,
-    /<tools?>[\s\S]*?<\/tools?>/gi,
-    /<\/?(?:function_calls?|tool_call|tool_use|tools?)\s*>/gi,
-  ];
-  for (const pattern of XML_TOOL_PATTERNS) {
-    text = text.replace(pattern, '');
-  }
-
-  // Clean up excess blank lines left by removals
   text = text.replace(/\n{3,}/g, '\n\n').trim();
 
   return text;
@@ -309,7 +294,12 @@ export function stripToolCallArtifacts(text: string): string {
 export function stripStreamingDelta(delta: string): string {
   if (!delta) return '';
   let cleaned = delta;
-  
+
+  cleaned = cleaned.replace(/<tool_result[^>]*>[\s\S]*?<\/tool_result>/g, '');
+  cleaned = cleaned.replace(/<\/tool_result>/g, '');
+  cleaned = cleaned.replace(/\n?<tool(?:_[a-z]*)?$/g, '');
+  cleaned = cleaned.replace(/\n?<t(?:o(?:o(?:l)?)?)?$/g, '');
+
   // Original patterns
   cleaned = cleaned.replace(/"arguments"\s*:\s*\}/g, '');
   cleaned = cleaned.replace(/,\s*"arguments"\s*:/g, '');
@@ -371,8 +361,7 @@ const TOOL_ECHO_PATTERNS: RegExp[] = [
   // "I ran/executed/called X and it returned/showed..."
   /\bI\s+(?:ran|executed|called|used|invoked)\s+[a-z_]+(?:\.\w+)?\s+(?:and\s+)?(?:it\s+)?(?:returned|showed|produced|gave|output(?:ted)?|found)/gi,
 
-  // "Based on the output/result from X..."
-  /\b[Bb]ased\s+on\s+(?:the\s+)?(?:output|result|response|content|data|findings)(?:\s+(?:from|of|returned\s+by))?(?:\s+(?:the\s+)?[a-z_]+(?:\.\w+)?)?/gi,
+  /\b[Bb]ased\s+on\s+(?:the\s+)?(?:output|result|response|content|data|findings)\s+(?:from|of|returned\s+by|given\s+by)\s+(?:the\s+)?[a-z_]+(?:\.\w+)?/gi,
 
   // "After calling/running/executing X..."
   /\b[Aa]fter\s+(?:calling|running|executing|using|invoking)\s+(?:the\s+)?[a-z_]+(?:\.\w+)?/gi,
@@ -427,7 +416,6 @@ export function stripToolEcho(text: string): string {
 
   result = filteredLines.join('\n');
 
-  // Clean up excess blank lines left by removals
   result = result.replace(/\n{3,}/g, '\n\n').trim();
 
   return result;
@@ -481,41 +469,4 @@ export function repairMalformedJson(malformedJson: string): string | null {
   } catch {
     return null; // Repair failed
   }
-}
-
-/**
- * Lightweight version — only strips XML tags without line-level thinking detection.
- * Used as a fast pre-filter for content that doesn't need thinking separation.
- */
-export function stripXmlTags(raw: string): string {
-  if (!raw) return '';
-  let text = raw;
-  
-  // Remove <think>content</think> blocks
-  while (true) {
-    const startMatch = text.match(QWEN_THINK_BLOCK_START);
-    if (!startMatch) break;
-    
-    const startIdx = startMatch.index!;
-    const startTagEnd = text.indexOf('>', startIdx) + 1;
-    const endTagName = text.substring(startIdx + 1, text.indexOf('>', startIdx));
-    const endPattern = new RegExp(`</${endTagName.replace(/[\s>].*/, '')}>`, 'i');
-    const endMatch = text.substring(startTagEnd).match(endPattern);
-    
-    if (endMatch) {
-      const endIdx = startTagEnd + endMatch.index!;
-      const before = text.substring(0, startIdx);
-      const after = text.substring(endIdx + endMatch[0].length);
-      const needsSpace = before.length > 0 && !/[\s\n]$/.test(before) && after.length > 0 && !/^[\s\n]/.test(after);
-      text = before + (needsSpace ? ' ' : '') + after;
-    } else {
-      const before = text.substring(0, startIdx);
-      text = before + (before.length > 0 && !/[\s\n]$/.test(before) ? ' ' : '');
-      break;
-    }
-  }
-  
-  text = text.replace(QWEN_THINK_TAG_PATTERN, ' ');
-  text = text.replace(/ {2,}/g, ' ');
-  return text.replace(/\n{3,}/g, '\n\n').trim();
 }

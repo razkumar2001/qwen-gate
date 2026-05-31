@@ -2,7 +2,7 @@ import { chromium, firefox, webkit, BrowserContext, Page, Cookie, Browser } from
 import path from 'path';
 import crypto from 'crypto';
 import { mkdirSync } from 'fs';
-import { getToken, getTokenWithAccount, ensureAuthenticated, pickAccount } from './auth.ts';
+import { getToken, getTokenWithAccount, pickAccount } from "./auth.ts";
 
 export type BrowserType = 'chromium' | 'firefox' | 'webkit' | 'chrome' | 'edge';
 
@@ -32,8 +32,6 @@ let cookiesInFlight: Promise<string> | null = null;
 
 // Cookie refresh interval (30s)
 const COOKIE_REFRESH_INTERVAL = 30 * 1000;
-// Context cleanup TTL (30min inactivity)
-const CONTEXT_CLEANUP_TTL = 30 * 60 * 1000;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -120,7 +118,6 @@ export async function getCookies(email?: string): Promise<string> {
     if (cachedCookies && (Date.now() - lastCookiesTime < COOKIES_TTL)) {
       return cachedCookies;
     }
-    // Get first available context
     for (const accCtx of accountContexts.values()) {
       const cookies = await accCtx.context.cookies();
       cachedCookies = cookies.map(c => `${c.name}=${c.value}`).join('; ');
@@ -150,7 +147,6 @@ export async function getBasicHeaders(email?: string): Promise<BasicHeaders> {
   
   // P0: Use cached userAgent (never changes during browser lifetime)
   if (!cachedUserAgent) {
-    // Get userAgent from any available context
     for (const accCtx of accountContexts.values()) {
       cachedUserAgent = await accCtx.page.evaluate(() => navigator.userAgent, { timeout: 10_000 } as any);
       break;
@@ -223,8 +219,6 @@ export async function initPlaywright(headless = true, browserType: BrowserType =
       break;
   }
 
-  console.log(`[Playwright] Launching ${browserType}...`);
-
   // Launch shared browser instance (not persistent context) for creating isolated contexts per account
   defaultBrowser = await browserEngine.launch({
     headless,
@@ -235,13 +229,10 @@ export async function initPlaywright(headless = true, browserType: BrowserType =
     ]
   });
 
-  // Setup cleanup handlers for graceful shutdown
   const cleanupAllContexts = async () => {
-    console.log('[AccountContext] Cleaning up all browser contexts...');
-    for (const [email, accCtx] of accountContexts.entries()) {
+    for (const [_email, accCtx] of accountContexts.entries()) {
       if (accCtx.refreshInterval) clearInterval(accCtx.refreshInterval);
       await accCtx.context.close();
-      console.log(`[AccountContext] Closed ${email}`);
     }
     accountContexts.clear();
     if (defaultBrowser) {
@@ -253,9 +244,6 @@ export async function initPlaywright(headless = true, browserType: BrowserType =
   process.on('SIGTERM', cleanupAllContexts);
   process.on('SIGINT', cleanupAllContexts);
 
-  console.log('[AccountContext] Browser initialized, contexts will be created on-demand');
-
-  console.log('[AccountContext] Browser initialized, contexts will be created on-demand');
   })().finally(() => {
     initInFlight = null;
   });
@@ -306,8 +294,6 @@ async function createContextInternal(email: string, cookies?: Record<string, str
     return accountContexts.get(email)!;
   }
   
-  console.log(`[AccountContext] Creating context for ${email}`);
-  
   // Create new isolated context with storage state if cookies provided
   const context = await defaultBrowser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
@@ -333,7 +319,6 @@ async function createContextInternal(email: string, cookies?: Record<string, str
   
   const page = await context.newPage();
   
-  // Setup header extraction via page.route
   const extractedHeaders: Record<string, string> = {};
   const routeHandler = async (route: any, request: any) => {
     const headers = request.headers();
@@ -366,7 +351,6 @@ async function createContextInternal(email: string, cookies?: Record<string, str
   };
   
   accountContexts.set(email, accCtx);
-  console.log(`[AccountContext] Created ${email}`);
   
   // Start auto-refresh interval for cookies (every 30s)
   accCtx.refreshInterval = setInterval(async () => {
@@ -398,7 +382,6 @@ export async function refreshAccountCookies(email: string): Promise<void> {
     
     if (!hasAuthCookie) {
       // Context expired, need to navigate to refresh
-      console.log(`[AccountContext] Context expired for ${email}, navigating to refresh`);
       validateQwenUrl('https://chat.qwen.ai/');
       await page.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: 15000 });
       await sleep(2000);
@@ -418,70 +401,28 @@ export async function refreshAccountCookies(email: string): Promise<void> {
       postCookies.splice(0, postCookies.length, ...postCookies);
     }
     
-    // Fetch fresh cookies
     const freshCookies = await context.cookies();
     const cookieRecord: Record<string, string> = {};
     for (const c of freshCookies) {
       cookieRecord[c.name] = c.value;
     }
     
-    // Update the account context
     accCtx.cookies = cookieRecord;
     accCtx.lastRefresh = Date.now();
     
-    console.log(`[AccountContext] Refreshed ${email} (${freshCookies.length} cookies)`);
   } catch (err) {
     console.error(`[AccountContext] Refresh error for ${email}:`, err);
     // Don't throw - let the interval continue, next attempt may succeed
   }
 }
 
-async function checkValidSession(email: string): Promise<boolean> {
-  const accCtx = accountContexts.get(email);
-  if (!accCtx) return false;
-  try {
-    const cookies = await accCtx.context.cookies();
-    const hasAuthCookie = cookies.some(c => c.name.toLowerCase().includes('token') || c.name.toLowerCase().includes('session'));
-    if (!hasAuthCookie) return false;
-    validateQwenUrl('https://chat.qwen.ai/');
-    await accCtx.page.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: 10000 });
-    const isLogged = !accCtx.page.url().includes('auth') && !accCtx.page.url().includes('login');
-    return isLogged;
-  } catch {
-    return false;
-  }
-}
 
-async function attemptAutoLogin(): Promise<void> {
-  const email = process.env.QWEN_EMAIL;
-  const password = process.env.QWEN_PASSWORD;
-  if (!email || !password) return;
-  console.log('[Playwright] Attempting auto-login with credentials from .env...');
-  try {
-    const success = await loginToQwen(email, password);
-    if (success) {
-      console.log('[Playwright] Auto-login successful.');
-      return;
-    }
-    console.warn('[Playwright] API login failed, trying UI fallback...');
-    const uiSuccess = await loginToQwenUI(email, password);
-    if (uiSuccess) {
-      console.log('[Playwright] UI login fallback successful.');
-    } else {
-      console.warn('[Playwright] Both API and UI login failed. Manual login may be required.');
-    }
-  } catch (err: any) {
-    console.error('[Playwright] Auto-login error:', err.message);
-  }
-}
 
 export async function closePlaywright() {
   if (process.env.TEST_MOCK_PLAYWRIGHT) return;
-  console.log('[AccountContext] Cleaning up all browser contexts...');
-  for (const [email, accCtx] of accountContexts.entries()) {
+  for (const [_email, accCtx] of accountContexts.entries()) {
     if (accCtx.refreshInterval) clearInterval(accCtx.refreshInterval);
     await accCtx.context.close();
-    console.log(`[AccountContext] Closed ${email}`);
   }
   accountContexts.clear();
   if (defaultBrowser) {
@@ -492,7 +433,6 @@ export async function closePlaywright() {
   cachedUserAgent = null;
   cachedCookies = null;
   lastCookiesTime = 0;
-  console.log('[AccountContext] All contexts closed');
 }
 
 // P0: Expose cached values for external use (e.g., sessionPool)
@@ -563,8 +503,6 @@ export async function loginToQwen(email: string, password: string): Promise<bool
   try {
   const page = getActivePage()!; // capture post-mutex — another caller could have closed it
 
-  console.log(`[Playwright] Attempting API login for ${email}...`);
-
   // Navigate to auth page to set up context/cookies
   validateQwenUrl('https://chat.qwen.ai/auth');
   await page.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded' });
@@ -593,13 +531,11 @@ export async function loginToQwen(email: string, password: string): Promise<bool
   }, { email, password: hashedPassword });
 
   if (result.ok) {
-    console.log('[Playwright] API login request successful.');
     // Navigate to home to confirm session
     validateQwenUrl('https://chat.qwen.ai/');
     await page.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded' });
     const isLogged = !(page.url().includes('auth') || page.url().includes('login'));
     if (isLogged) {
-       console.log('[Playwright] Login confirmed.');
        return true;
     }
   }
@@ -611,56 +547,6 @@ export async function loginToQwen(email: string, password: string): Promise<bool
   }
 }
 
-async function loginToQwenUI(email: string, password: string): Promise<boolean> {
-  const page = getActivePage();
-  if (!page) throw new Error('Playwright not initialized');
-
-  // Serialize: UI login mutates shared activePage + global cookie jar
-  const release = await uiMutex.acquire();
-  try {
-
-  console.log('[Playwright] Attempting UI login...');
-  validateQwenUrl('https://chat.qwen.ai/auth');
-  await page.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded' });
-  await sleep(2000);
-
-  if (!page.url().includes('/auth')) {
-    console.log('[Playwright] Already logged in');
-    return true;
-  }
-
-  try {
-    await page.waitForSelector('input[type="email"], input[placeholder*="Email"]', { timeout: 5000 });
-  } catch {
-    if (page.url().includes('/auth')) throw new Error('Email input not found');
-    console.log('[Playwright] Already logged in');
-    return true;
-  }
-
-  console.log('[Playwright] UI: Filling email...');
-  await page.fill('input[type="email"], input[placeholder*="Email"]', email);
-  await page.keyboard.press('Enter');
-  await sleep(1000);
-
-  await page.waitForSelector('input[type="password"]', { timeout: 10000 });
-  console.log('[Playwright] UI: Filling password...');
-  await page.fill('input[type="password"]', password);
-  await page.keyboard.press('Enter');
-
-  await sleep(2000);
-
-  const isLogged = !page.url().includes('auth') && !page.url().includes('login');
-  if (isLogged) {
-    console.log('[Playwright] UI login OK');
-    return true;
-  }
-
-  console.log('[Playwright] UI login failed');
-  return false;
-  } finally {
-    release();
-  }
-}
 
 /**
  * Capture bx-headers by making a deliberate API call from the page context.
@@ -697,7 +583,6 @@ export async function openBrowserProfile(email: string, password?: string, optio
   const headless = options?.headless ?? false;
   const profileDir = getProfileDir(email);
   const mode = headless ? 'headless' : 'visible';
-  console.log(`[BrowserProfile] Opening persistent profile for ${email} (${mode}) at ${profileDir}`);
 
   let context: any = null;
   let page: any = null;
@@ -735,19 +620,16 @@ export async function openBrowserProfile(email: string, password?: string, optio
     const existingCookies: Cookie[] = await context.cookies();
     const existingToken = existingCookies.find((c: Cookie) => c.name === 'token');
     if (existingToken && existingToken.expires && existingToken.expires * 1000 > Date.now()) {
-      console.log(`[BrowserProfile] ${email} already has valid token cookie in profile — skipping browser launch`);
       await context.close();
       return 'success';
     }
 
     page = context.pages()[0] || await context.newPage();
 
-    console.log('[BrowserProfile] Navigating to auth page...');
     validateQwenUrl('https://chat.qwen.ai/auth');
     await page.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded', timeout: 30000 });
 
     if (password) {
-      console.log('[BrowserProfile] Filling credentials...');
       try {
         await page.waitForSelector('input[type="email"], input[placeholder*="Email"], input[name="email"], input[name="login"]', { timeout: 8000 });
         const emailInput = page.locator('input[type="email"], input[placeholder*="Email"], input[name="email"], input[name="login"]').first();
@@ -756,24 +638,18 @@ export async function openBrowserProfile(email: string, password?: string, optio
         await page.waitForSelector('input[type="password"], input[name="password"]', { timeout: 5000 });
         const passwordInput = page.locator('input[type="password"], input[name="password"]').first();
         await passwordInput.fill(password);
-        console.log('[BrowserProfile] Credentials filled.');
 
         try {
           const submitBtn = page.locator('button[type="submit"], button:has-text("Sign in"), button:has-text("Login"), button:has-text("Log in")').first();
           await submitBtn.click({ timeout: 3000 });
-          console.log('[BrowserProfile] Submit button clicked. Waiting for login...');
         } catch {
-          console.log('[BrowserProfile] Could not auto-click submit — user may need to click manually.');
         }
       } catch {
-        console.log('[BrowserProfile] Could not find form fields — log in manually.');
       }
     } else {
-      console.log('[BrowserProfile] No password provided — user must log in manually.');
     }
 
     const maxAttempts = headless ? 15 : Infinity;
-    console.log(`[BrowserProfile] Polling for login (${headless ? 'headless, max 30s' : 'visible, close browser when done'}).`);
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       await sleep(2000);
 
@@ -781,11 +657,9 @@ export async function openBrowserProfile(email: string, password?: string, optio
         const cookies: Cookie[] = await context.cookies();
         const tokenCookie = cookies.find((c: Cookie) => c.name === 'token');
         if (tokenCookie) {
-          console.log('[BrowserProfile] Auth cookie detected!');
           const { saveCookies } = await import('./auth.ts');
           await saveCookies(email, tokenCookie.value);
 
-          console.log('[BrowserProfile] Login complete. Closing browser...');
           try { await context.close(); } catch {}
           return 'success';
         }
@@ -808,23 +682,25 @@ export async function openBrowserProfile(email: string, password?: string, optio
             });
             if (hasCaptcha) {
               if (headless) {
-                console.log('[BrowserProfile] CAPTCHA detected in headless mode — closing browser, user must solve manually');
-                try { await context.close(); } catch {}
+                try { await context.close(); } catch {
+                  // intentional: context close failure is non-blocking, continue return
+                }
                 return 'captcha';
               }
-              console.log('[BrowserProfile] CAPTCHA/verification challenge detected — keeping browser open for manual solving');
             }
           } catch {
+            // intentional: captcha detection failure is non-blocking, continue polling
           }
         }
       } catch {
-        console.log('[BrowserProfile] Browser closed by user.');
-        try { await context.close(); } catch {}
+        try { await context.close(); } catch {
+          // intentional: context close failure is non-blocking, page already closed
+        }
         return 'closed';
       }
     }
 
-    console.log('[BrowserProfile] Headless timeout — no login detected, closing browser');
+    console.error('[BrowserProfile] Headless timeout — no login detected, closing browser');
     try { await context.close(); } catch {}
     return 'error';
   } catch (err: any) {
@@ -838,7 +714,6 @@ export async function refreshViaProfile(email: string): Promise<boolean> {
   if (process.env.TEST_MOCK_PLAYWRIGHT) return true;
 
   const profileDir = getProfileDir(email);
-  console.log(`[BrowserProfile] Refreshing token via persistent profile for ${email}`);
 
   let context: any = null;
 
@@ -872,18 +747,23 @@ export async function refreshViaProfile(email: string): Promise<boolean> {
       if (tokenCookie && tokenCookie.expires && tokenCookie.expires * 1000 > Date.now()) {
         const { saveCookies } = await import('./auth.ts');
         await saveCookies(email, tokenCookie.value);
-        console.log(`[BrowserProfile] Token refreshed via profile for ${email}`);
-        try { await context.close(); } catch {}
+        try { await context.close(); } catch {
+          // intentional: context close failure is non-blocking, token already saved
+        }
         return true;
       }
     }
 
-    console.log(`[BrowserProfile] No valid token found after profile navigation for ${email}`);
-    try { await context.close(); } catch {}
+    console.error(`[BrowserProfile] No valid token found after profile navigation for ${email}`);
+    try { await context.close(); } catch {
+      // intentional: context close failure is non-blocking, no token to save
+    }
     return false;
   } catch (err: any) {
     console.error(`[BrowserProfile] Profile refresh error for ${email}:`, err.message);
-    if (context) { try { await context.close(); } catch {} }
+    if (context) { try { await context.close(); } catch {
+      // intentional: context close failure during error recovery is non-blocking
+    } }
     return false;
   }
 }
@@ -915,7 +795,6 @@ export async function getQwenHeaders(email?: string): Promise<{ headers: Record<
     throw new Error('No account available for header extraction');
   }
 
-  // Get or create the account context
   let accCtx = accountContexts.get(targetEmail);
   if (!accCtx) {
     // Try to get initial cookies from auth service
@@ -933,7 +812,6 @@ export async function getQwenHeaders(email?: string): Promise<{ headers: Record<
     accCtx = accountContexts.get(targetEmail)!;
   }
 
-  // Extract current headers from the account's context
   const cookies = await accCtx.context.cookies();
   const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
   
@@ -942,7 +820,6 @@ export async function getQwenHeaders(email?: string): Promise<{ headers: Record<
     'cookie': cookieStr
   };
   
-  // Update cached headers for this account
   accCtx.headers = headers;
   accCtx.lastRefresh = Date.now();
 

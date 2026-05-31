@@ -9,9 +9,7 @@
  */
 
 import { appendFileSync, mkdirSync } from 'fs';
-import { dirname, resolve } from 'path';
-
-// ─── System Log Levels & Categories ─────────────────────────────────────────────
+import { resolve } from "path";
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -37,8 +35,6 @@ export interface SystemLogFilter {
   since?: string;
   limit?: number;
 }
-
-// ─── Request Log Entry (existing) ───────────────────────────────────────────────
 
 export interface LogEntry {
   id: string;
@@ -125,15 +121,12 @@ class LogStore {
   private systemIdCounter = 0;
   private serverStartTime = Date.now();
 
-
   enablePersistence(dirPath: string): void {
     try {
       mkdirSync(dirPath, { recursive: true });
       const date = new Date().toISOString().slice(0, 10);
       this.persistencePath = resolve(dirPath, `qwen-gate-${date}.log`);
       this.requestLogPath = resolve(dirPath, `requests-${date}.jsonl`);
-      console.log(`[LogStore] Persistence enabled: ${this.persistencePath}`);
-      console.log(`[LogStore] Request log: ${this.requestLogPath}`);
     } catch (err) {
       console.error(`[LogStore] Failed to enable persistence:`, err);
     }
@@ -163,7 +156,7 @@ class LogStore {
         networkTiming: entry.networkTiming,
       };
       appendFileSync(this.requestLogPath, JSON.stringify(record) + '\n');
-    } catch (err) {
+    } catch (_err) {
       // Swallow write errors — logging must never break the request path
     }
   }
@@ -199,7 +192,6 @@ class LogStore {
     const meta = metadata ? ` ${JSON.stringify(metadata)}` : '';
     if (level === 'error') console.error(`${prefix} [${category}] ${message}${meta}`);
     else if (level === 'warn') console.warn(`${prefix} [${category}] ${message}${meta}`);
-    else console.log(`${prefix} [${category}] ${message}${meta}`);
   }
 
   debug(category: string, message: string, metadata?: Record<string, unknown>): void {
@@ -353,25 +345,17 @@ class LogStore {
     return Math.floor((Date.now() - this.serverStartTime) / 1000);
   }
 
-  // ─── Model Health Tracking ──────────────────────────────────────────────────
-
   private modelErrorCounts: Map<string, number> = new Map();
   private modelSuccessCounts: Map<string, number> = new Map();
   private readonly MODEL_HEALTH_WINDOW_MS = 5 * 60 * 1000; // 5 minute sliding window
   private modelHealthTimestamps: Map<string, number> = new Map();
 
-  /**
-   * Record an error for a specific model - used by ModelRouter for health tracking
-   */
   recordModelError(model: string): void {
     const count = this.modelErrorCounts.get(model) || 0;
     this.modelErrorCounts.set(model, count + 1);
     this.modelHealthTimestamps.set(model, Date.now());
   }
 
-  /**
-   * Record a success for a specific model - used by ModelRouter for health tracking
-   */
   recordModelSuccess(model: string): void {
     const count = this.modelSuccessCounts.get(model) || 0;
     this.modelSuccessCounts.set(model, count + 1);
@@ -428,8 +412,6 @@ class LogStore {
     }
     return result;
   }
-
-  // ─── Tool Discipline Metrics ──────────────────────────────────────────────
 
   private toolCallValidationFailures = 0;
   private hallucinatedToolNames = 0;

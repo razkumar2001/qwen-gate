@@ -20,24 +20,9 @@ const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const SERVER_ENTRY = resolve(__dirname, 'index.ts');
 
 function showHelp() {
-  console.log(`
-qg - Qwen Gate CLI
-
-Usage:
-  qg                    Start the gateway server
-  qg login <email>      Authenticate account
-  qg restart            Restart the gateway server
-  qg ulw [on|off]       Toggle ultrawork mode (default: on)
-  qg --help             Show this help
-
-Examples:
-  qg login user@example.com
-  qg ulw off
-`);
 }
 
 async function startServer() {
-  console.log('[qg] Starting gateway server...');
   const server = spawn('tsx', [SERVER_ENTRY], {
     stdio: 'inherit',
     shell: true,
@@ -59,13 +44,10 @@ async function handleLogin(email: string) {
     console.error('Usage: qg login <user@example.com>');
     process.exit(1);
   }
-  console.log(`[qg] Authenticating ${email}...`);
   await performLogin(email);
-  console.log('[qg] Authentication complete');
 }
 
 async function restartServer() {
-  console.log('[qg] Restarting gateway server...');
   
   const isWindows = process.platform === 'win32';
   const killCmd = isWindows 
@@ -93,15 +75,14 @@ async function toggleUltrawork(mode?: string) {
       content += (content.endsWith('\n') ? '' : '\n') + `ULW_ENABLED=${enabled}\n`;
     }
     writeFileSync(configPath, content);
-    console.log(`[qg] Updated ${configPath}`);
   } else {
-    console.log(`[qg] Note: No .env file found at ${configPath}`);
+    // intentional: config file doesn't exist yet, will be created on first use
   }
   
   if (enabled) {
-    console.log('[qg] Ultrawork mode enabled - maximum precision active');
+    // intentional: no-op when enabling, server will pick up config on restart
   } else {
-    console.log('[qg] Ultrawork mode disabled - standard mode');
+    // intentional: no-op when disabling, server will pick up config on restart
   }
 }
 

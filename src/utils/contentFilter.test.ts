@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { filterContent, stripToolCallArtifacts, stripToolEcho } from './contentFilter.ts';
+import { filterContent, stripToolCallArtifacts, stripToolEcho, stripStreamingDelta } from './contentFilter.ts';
 
 test('filterContent preserves instructional "I want to" prose', () => {
   const input = 'I want to help you fix this bug.\n\nThe issue is in auth.ts line 42 where the token check uses < instead of <=.';
@@ -59,10 +59,9 @@ test('stripToolCallArtifacts removes JSON tool calls', () => {
 });
 
 test('stripToolCallArtifacts preserves normal JSON', () => {
-  const input = 'Here is an example:\njson\n{"key": "value", "count": 42}\n';
+  const input = 'Here is some JSON: {"key": "value"}';
   const result = stripToolCallArtifacts(input);
-  // JSON without "name" field should be preserved
-  assert.ok(result.includes('"key"'), `Should keep non-tool JSON: "${result}"`);
+  assert.strictEqual(result, input);
 });
 
 // ─── Tool Echo Guard Tests ─────────────────────────────────────────────
@@ -203,4 +202,89 @@ test('S6b: stripToolCallArtifacts preserves code block with JSON', () => {
   const result = stripToolCallArtifacts(input);
   assert.ok(result.includes('"host"'), `Code block JSON stripped: "${result}"`);
   assert.ok(result.includes('"port"'), `Code block JSON stripped: "${result}"`);
+});
+
+const TRC = '<' + '/tool_result>';
+
+function toolBlock(name: string, callId: string, content: string): string {
+  return '<tool_result name="' + name + '" call_id="' + callId + '">\n' + content + '\n' + TRC;
+}
+
+test('XML-1: stripToolCallArtifacts strips complete tool_result blocks', () => {
+  const input = 'Here is my analysis.\n\n' + toolBlock('bash', 'tc_123', 'file1.ts\nfile2.ts\nline 42: error') + '\n\nBased on the results, the fix is in auth.ts.';
+  const result = stripToolCallArtifacts(input);
+  assert.ok(!result.includes('<tool_result'), 'tool_result tag leaked: ' + JSON.stringify(result));
+  assert.ok(!result.includes('file1.ts'), 'tool content leaked: ' + JSON.stringify(result));
+  assert.ok(!result.includes('line 42: error'), 'tool content leaked: ' + JSON.stringify(result));
+  assert.ok(result.includes('Here is my analysis'), 'Pre-text lost: ' + JSON.stringify(result));
+  assert.ok(result.includes('Based on the results'), 'Post-text lost: ' + JSON.stringify(result));
+});
+
+test('XML-2: stripToolCallArtifacts strips multiple tool_result blocks', () => {
+  const input = 'Starting work.\n\n' + toolBlock('bash', 'tc_1', 'output1') + '\n\nNow checking files.\n\n' + toolBlock('read', 'tc_2', 'file content here') + '\n\nAll done.';
+  const result = stripToolCallArtifacts(input);
+  assert.ok(!result.includes('output1'), 'First tool content leaked: ' + JSON.stringify(result));
+  assert.ok(!result.includes('file content here'), 'Second tool content leaked: ' + JSON.stringify(result));
+  assert.ok(result.includes('Starting work'), 'Pre-text lost: ' + JSON.stringify(result));
+  assert.ok(result.includes('Now checking files'), 'Mid-text lost: ' + JSON.stringify(result));
+  assert.ok(result.includes('All done'), 'Post-text lost: ' + JSON.stringify(result));
+});
+
+test('XML-3: stripToolCallArtifacts strips orphaned closing tags', () => {
+  const input = 'Some text with orphaned closing\n' + TRC + '\nMore text.';
+  const result = stripToolCallArtifacts(input);
+  assert.ok(!result.includes('tool_result>'), 'Orphaned close tag leaked: ' + JSON.stringify(result));
+  assert.ok(result.includes('Some text'), 'Pre-text lost: ' + JSON.stringify(result));
+  assert.ok(result.includes('More text'), 'Post-text lost: ' + JSON.stringify(result));
+});
+
+test('XML-4: stripToolCallArtifacts strips partial opening tag at end of text', () => {
+  const input = 'Analysis complete.\n<tool_result name="bash"';
+  const result = stripToolCallArtifacts(input);
+  assert.ok(!result.includes('<tool_result'), 'Partial open tag leaked: ' + JSON.stringify(result));
+  assert.ok(result.includes('Analysis complete'), 'Pre-text lost: ' + JSON.stringify(result));
+});
+
+test('XML-5: stripStreamingDelta strips partial tool_result tag fragments', () => {
+  const input1 = 'Some text\n<tool_resul';
+  const result1 = stripStreamingDelta(input1);
+  assert.ok(!result1.includes('<tool_resul'), 'Partial tag fragment leaked: ' + JSON.stringify(result1));
+
+  const input2 = 'text\n<tool_result';
+  const result2 = stripStreamingDelta(input2);
+  assert.ok(!result2.includes('<tool_result'), 'Opening tag leaked: ' + JSON.stringify(result2));
+
+  const input3 = 'content\n' + TRC;
+  const result3 = stripStreamingDelta(input3);
+  assert.ok(!result3.includes('tool_result>'), 'Closing tag leaked: ' + JSON.stringify(result3));
+});
+
+test('XML-7: stripToolCallArtifacts strips unmatched opening tag with trailing content (mid-stream leak)', () => {
+  const input = 'Here is the answer.\n<tool_result name="read" call_id="123">\nfile content here\nmore leaked content';
+  const result = stripToolCallArtifacts(input);
+  assert.ok(!result.includes('<tool_result'), 'Opening tag leaked: ' + JSON.stringify(result));
+  assert.ok(!result.includes('file content'), 'Tool result content leaked: ' + JSON.stringify(result));
+  assert.ok(result.includes('Here is the answer'), 'Pre-text lost: ' + JSON.stringify(result));
+});
+
+test('XML-8: stripToolCallArtifacts strips unmatched opening tag after complete block removed', () => {
+  const input = '<tool_result name="bash" call_id="1">\noutput\n</tool_result>\n\nMiddle.\n<tool_result name="read" call_id="2">\nleaked';
+  const result = stripToolCallArtifacts(input);
+  assert.ok(!result.includes('<tool_result'), 'Second opening tag leaked: ' + JSON.stringify(result));
+  assert.ok(!result.includes('leaked'), 'Second block content leaked: ' + JSON.stringify(result));
+  assert.ok(result.includes('Middle'), 'Pre-second-block text lost: ' + JSON.stringify(result));
+});
+
+test('XML-6: stripToolCallArtifacts preserves non-tool XML in content', () => {
+  const input = 'Here is an HTML example:\n\n<div class="container">\n  <p>Hello</p>\n</div>\n\nAnd some JSX:\n\n<Component prop="value" />';
+  const result = stripToolCallArtifacts(input);
+  assert.ok(result.includes('<div'), 'HTML div stripped: ' + JSON.stringify(result));
+  assert.ok(result.includes('<p>Hello</p>'), 'HTML p stripped: ' + JSON.stringify(result));
+  assert.ok(result.includes('<Component'), 'JSX stripped: ' + JSON.stringify(result));
+});
+
+test('stripToolEcho preserves "Based on the results" reasoning', () => {
+  const input = 'Based on the results, the fix is in auth.ts.';
+  const result = stripToolEcho(input);
+  assert.ok(result.includes('Based on the results'), 'Legitimate reasoning stripped: ' + JSON.stringify(result));
 });

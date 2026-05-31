@@ -69,13 +69,11 @@ function validate(
     return value;
   }
 
-  // Handle $ref first — it replaces the entire schema
   if (schema.$ref) {
     const resolved = resolveRef(schema.$ref, ctx);
     return validate(value, resolved, path, ctx);
   }
 
-  // Handle composition keywords
   if (schema.allOf) {
     value = validateAllOf(value, schema.allOf, path, ctx);
   }
@@ -186,8 +184,6 @@ function validateByType(
   }
 }
 
-// ─── $ref Resolution ───────────────────────────────────────────────────────────
-
 function resolveRef(ref: string, ctx: ValidationContext): JsonSchema {
   // Only support local refs: #/$defs/Foo or #/definitions/Foo
   if (!ref.startsWith('#/')) {
@@ -217,8 +213,6 @@ function resolveRef(ref: string, ctx: ValidationContext): JsonSchema {
 
   return current as JsonSchema;
 }
-
-// ─── Composition Keywords ──────────────────────────────────────────────────────
 
 function validateAllOf(
   value: unknown,
@@ -337,8 +331,6 @@ function validateIfThenElse(
   return value;
 }
 
-// ─── Object Validation ─────────────────────────────────────────────────────────
-
 function validateObject(
   value: unknown,
   schema: JsonSchema,
@@ -363,7 +355,6 @@ function validateObject(
   const obj = value as Record<string, unknown>;
   const validated: Record<string, unknown> = {};
 
-  // Check required properties
   if (schema.required) {
     for (const req of schema.required) {
       if (!(req in obj) || obj[req] === undefined) {
@@ -393,7 +384,6 @@ function validateObject(
     );
   }
 
-  // Validate and collect properties
   const properties = schema.properties || {};
   const patternProperties = schema.patternProperties || {};
   const seenKeys = new Set<string>();
@@ -405,7 +395,6 @@ function validateObject(
     if (propSchema) {
       validated[key] = validate(val, propSchema, `${path}.${key}`, ctx);
     } else {
-      // Check patternProperties
       let matchedPattern = false;
       for (const [pattern, patSchema] of Object.entries(patternProperties)) {
         if (new RegExp(pattern).test(key)) {
@@ -444,8 +433,6 @@ function validateObject(
 
   return validated;
 }
-
-// ─── Array Validation ──────────────────────────────────────────────────────────
 
 function validateArray(
   value: unknown,
@@ -512,8 +499,6 @@ function validateArray(
 
   return value;
 }
-
-// ─── String Validation ─────────────────────────────────────────────────────────
 
 function validateString(
   value: unknown,
@@ -622,8 +607,6 @@ function validateFormat(value: string, format: string, path: string): void {
   }
 }
 
-// ─── Number Validation ─────────────────────────────────────────────────────────
-
 function validateNumber(
   value: unknown,
   schema: JsonSchema,
@@ -693,8 +676,6 @@ function validateNumber(
   return value;
 }
 
-// ─── Boolean Validation ────────────────────────────────────────────────────────
-
 function validateBoolean(
   value: unknown,
   _schema: JsonSchema,
@@ -709,8 +690,6 @@ function validateBoolean(
   }
   return value;
 }
-
-// ─── Utility ───────────────────────────────────────────────────────────────────
 
 function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;

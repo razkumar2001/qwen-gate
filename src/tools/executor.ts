@@ -19,8 +19,6 @@ import { registry } from './registry.ts';
 import { robustParseJSON } from '../utils/json.ts';
 import { validateToolCalls } from './guard.ts';
 
-// ─── Configuration ─────────────────────────────────────────────────────────────
-
 export interface ExecutionLoopConfig {
   maxTurns?: number;
   debug?: boolean;
@@ -63,15 +61,9 @@ export interface LLMResponse {
   finishReason: string;
 }
 
-// ─── Constants ─────────────────────────────────────────────────────────────────
-
 const DEFAULT_MAX_CONCURRENCY = 10;
 const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
 const MAX_GUARD_RETRIES = 3;
-
-
-
-// ─── Content Parsing ───────────────────────────────────────────────────────────
 
 /**
  * Extract tool calls embedded in free-form text content.
@@ -129,7 +121,7 @@ export function parseToolCallsFromContent(content: string): {
       toolCalls.push({
         id: 'call_' + uuidv4(),
         name: parsed.name || '',
-        arguments: args || (() => { const { name, ...rest } = parsed; return rest; })(),
+        arguments: args || (() => { const { name: _name, ...rest } = parsed; return rest; })(),
       });
     } catch {
       textContent += jsonStr;
@@ -164,8 +156,6 @@ function findBalancedJsonEnd(s: string): number {
   }
   return -1;
 }
-
-// ─── Tool Execution ────────────────────────────────────────────────────────────
 
 /**
  * Execute a single tool call with timeout protection.
@@ -270,8 +260,6 @@ export async function executeToolCalls(
   return results;
 }
 
-// ─── Message Builders ──────────────────────────────────────────────────────────
-
 function buildToolMessage(result: ToolCallResult): Record<string, unknown> {
   return {
     role: 'tool',
@@ -300,8 +288,6 @@ function buildAssistantToolCallMessage(
   if (content) msg.content = content;
   return msg;
 }
-
-// ─── Tool Call Repair ──────────────────────────────────────────────────────────
 
 /**
  * Attempt to auto-repair malformed tool calls.
@@ -364,8 +350,6 @@ function repairJson(raw: string): string | null {
   return s !== raw.trim() ? s : null;
 }
 
-// ─── Execution Loop ────────────────────────────────────────────────────────────
-
 /**
  * Run the agentic execution loop.
  * Sends messages to the LLM, processes tool calls, feeds results back,
@@ -393,7 +377,6 @@ export async function runExecutionLoop(
   while (true) {
     turn++;
     if (debug) {
-      console.log(`[executor] Turn ${turn}, messages: ${messages.length}`);
     }
 
     const response = await sendToLLM(messages, tools, model);
@@ -415,7 +398,7 @@ export async function runExecutionLoop(
 
     if (effectiveToolCalls.length === 0) {
       if (debug) {
-        console.log('[executor] No tool calls, loop complete');
+        // intentional: debug logging placeholder for no-tool-call path
       }
       return effectiveContent || '';
     }
@@ -435,7 +418,6 @@ export async function runExecutionLoop(
       if (consecutiveGuardFailures >= MAX_GUARD_RETRIES) {
         const normResult = normalizeToolCalls(effectiveToolCalls);
         if (normResult.fixed.length > 0) {
-          if (debug) console.log(`[executor] Auto-repaired ${normResult.fixed.length} tool calls`);
           effectiveToolCalls.length = 0;
           effectiveToolCalls.push(...normResult.fixed);
           const repairedGuard = validateToolCalls(effectiveToolCalls);
@@ -456,13 +438,13 @@ export async function runExecutionLoop(
       }
 
       if (debug) {
-        console.log(`[executor] tool call validation FAILED (attempt ${consecutiveGuardFailures}/${MAX_GUARD_RETRIES}):`, guardResult.errors);
+        console.error(`[executor] tool call validation FAILED (attempt ${consecutiveGuardFailures}/${MAX_GUARD_RETRIES}):`, guardResult.errors);
       }
 
       const escalation = [
         '',
         `  FIX YOUR FORMAT. Use: {"name":"tool","arguments":{"key":"value"}}`,
-        `  CRITICAL: Your tool calls are STILL broken. You MUST output PURE JSON with no XML tags, no markdown fences, no stringified arguments. Correct format: {"name":"tool_name","arguments":{"param":"value"}}`,
+        `  CRITICAL: Your tool calls are STILL broken. You MUST output PURE JSON only. No wrappers, no fences, no markdown. Correct format: {"name":"tool_name","arguments":{"param":"value"}}`,
       ];
       messages.push({
         role: 'system',
@@ -482,7 +464,6 @@ export async function runExecutionLoop(
     const recentCount = toolCallWindow.slice(-10).length;
     const uniqueRecent = new Set(toolCallWindow.slice(-10)).size;
     if (recentCount > 3 && uniqueRecent <= 2) {
-      if (debug) console.log('[executor] Detected potential tool call loop');
       messages.push({
         role: 'system',
         content: '[SYSTEM: You appear to be calling the same tools repeatedly without progress. Please vary your approach or provide a text response.]',
@@ -502,10 +483,9 @@ export async function runExecutionLoop(
     // Aggregate results and report errors
     const errorResults = toolResults.filter(r => r.isError);
     if (debug && errorResults.length > 0) {
-      console.log(`[executor] ${errorResults.length}/${toolResults.length} tool calls failed`);
+      console.error(`[executor] ${errorResults.length}/${toolResults.length} tool calls failed`);
     }
 
-    // Build messages with tool results
     for (const result of toolResults) {
       messages.push(buildToolMessage(result));
     }

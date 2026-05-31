@@ -1,7 +1,6 @@
 import { chromium } from 'playwright';
-import { closePlaywright } from './services/playwright.ts';
+import { closePlaywright, getProfileDir } from "./services/playwright.ts";
 import { saveCookies } from './services/auth.ts';
-import { getProfileDir } from './services/playwright.ts';
 import * as dotenv from 'dotenv';
 
 dotenv.config();
@@ -12,11 +11,9 @@ dotenv.config();
  * @returns Promise that resolves when session is saved
  */
 export async function login(email: string): Promise<void> {
-  console.log(`[Login] Logging in as ${email}`);
   
   // Use persistent context so browser UI state (cookies, localStorage) survives across runs
   const profileDir = getProfileDir(email);
-  console.log(`[Login] Using persistent profile: ${profileDir}`);
   
   const context = await chromium.launchPersistentContext(profileDir, {
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -27,28 +24,22 @@ export async function login(email: string): Promise<void> {
   const page = await context.newPage();
 
   await page.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded' });
-  console.log('Browser opened. Please login to chat.qwen.ai.');
-  console.log('Once you see the chat interface, press ENTER here to save the session.');
 
   await new Promise<void>(resolve => {
     process.stdin.once('data', () => resolve());
   });
 
-  console.log('[Login] Extracting session data...');
   const cookies = await context.cookies();
   const tokenCookie = cookies.find(c => c.name === 'token');
   const refreshCookie = cookies.find(c => c.name === 'refresh_token');
 
   if (!tokenCookie?.value) {
     console.error('No token cookie found. Login may have failed.');
-    console.log('Cookies found:', cookies.map(c => c.name).join(', '));
     await closePlaywright();
     process.exit(1);
   }
 
   await saveCookies(email, tokenCookie.value, refreshCookie?.value || null);
-  console.log(`[Login] Session saved for ${email}. You can now use this account.`);
-  console.log('To add another account, run again: npm run login other@example.com');
   // Close persistent context (browser exits automatically)
   await context.close();
 }

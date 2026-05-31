@@ -79,7 +79,6 @@ export class SessionPool {
       this.activeSessions.add(chatId);
       this.activeCount++;
       const emailLabel = entry.accountEmail ? ` (${entry.accountEmail.split('@')[0]})` : '';
-      console.log(`[SessionPool] Fresh session: ${chatId.substring(0, 8)}...${emailLabel}`);
       logStore.log('info', 'pool', 'Session acquired' + (entry.accountEmail ? ': ' + entry.accountEmail.split('@')[0] : ''));
       return entry;
     } catch (err) {
@@ -152,7 +151,6 @@ export class SessionPool {
   async deleteSession(chatId: string, cachedHeaders?: { cookie: string; userAgent: string }, accountEmail?: string): Promise<void> {
     if (process.env.TEST_MOCK_PLAYWRIGHT) return;
     if (process.env.DELETE_SESSION === 'false') {
-      console.log(`[SessionPool] DELETE_SESSION=false, keeping ${chatId.substring(0, 8)}...`);
       return;
     }
 
@@ -186,7 +184,6 @@ export class SessionPool {
       recordResponse(debugEntry.id, response);
       if (response.ok) {
         completeEntry(debugEntry.id);
-        console.log(`[SessionPool] Deleted session ${chatId.substring(0, 8)}...`);
       } else {
         errorEntry(debugEntry.id, `Delete returned ${response.status}`);
       }

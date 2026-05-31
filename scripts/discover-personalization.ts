@@ -57,7 +57,9 @@ async function main() {
         });
         console.log(`[RES] ${response.status()} ${url}`);
         console.log(`  Body preview: ${body.substring(0, 500)}`);
-      } catch {}
+      } catch {
+        // intentional: response body read failure is non-blocking, continue discovery
+      }
     }
   });
 
@@ -146,7 +148,9 @@ async function main() {
           reactState = 'React fiber found (key: ' + fiberKey + ')';
         }
       }
-    } catch {}
+    } catch {
+      // intentional: page evaluation failure is non-blocking, continue with empty data
+    }
 
     // Get all script tags with inline data
     const scriptData: string[] = [];

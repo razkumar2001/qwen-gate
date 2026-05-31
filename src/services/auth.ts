@@ -15,9 +15,6 @@ function createAuthFetchTimeout(): { controller: AbortController; cleanup: () =>
   };
 }
 
-// ─── Login Mutex ────────────────────────────────────────────────────────────────
-// Serialize browser-context logins: only one activePage, cookie clearing is global.
-// Local implementation to avoid circular dependency with playwright.ts.
 class LoginMutex {
   private queue: (() => void)[] = [];
   private locked = false;
@@ -43,8 +40,6 @@ class LoginMutex {
     }
   }
 }
-
-// ─── Playwright Session Check ───────────────────────────────────────────────────
 
 /**
  * Check if Playwright has an active browser session with auth cookies.
@@ -89,7 +84,6 @@ const AUTH_REFRESH_BEFORE_MS = parseInt(process.env.AUTH_REFRESH_BEFORE_MS || St
 const DEFAULT_THROTTLE_MS = parseInt(process.env.RATE_LIMIT_COOLDOWN_MS || String(120_000), 10);
 
 let accounts: AccountEntry[] = [];
-let roundRobinIndex = 0;
 let initDone = false;
 
 function parseAccountsFromEnv(): Array<{ email: string; password: string }> {
@@ -145,8 +139,6 @@ function discoverSavedAccounts(): Array<{ email: string; password: string }> {
   }
 }
 
-// ─── Account Selection ──────────────────────────────────────────────────────────
-
 function isAvailable(acct: AccountEntry): boolean {
   if (!acct.state) return false;
   if (acct.throttledUntil > Date.now()) return false;
@@ -191,30 +183,16 @@ export function pickAccount(): AccountEntry | null {
   return candidates[0];
 }
 
-// ─── In-Flight & Request Tracking ───────────────────────────────────────────────
-
-/**
- * Mark an account as having an in-flight request.
- * Called from SessionPool.acquire() before async ops begin.
- */
 export function incrementInFlight(email: string): void {
   const acct = getAccountByEmail(email);
   if (acct) acct.inFlight++;
 }
 
-/**
- * Mark an account's in-flight request as completed.
- * Called from SessionPool.release().
- */
 export function decrementInFlight(email: string): void {
   const acct = getAccountByEmail(email);
   if (acct && acct.inFlight > 0) acct.inFlight--;
 }
 
-/**
- * Increment the total request count for an account.
- * Called from SessionPool.release() after a request completes.
- */
 export function incrementTotalRequests(email: string): void {
   const acct = getAccountByEmail(email);
   if (acct) acct.totalRequests++;
@@ -234,8 +212,6 @@ export function hasInFlight(email: string): boolean {
 export function getAccountByEmail(email: string): AccountEntry | null {
   return accounts.find(a => a.email === email) || null;
 }
-
-// ─── Token Access ───────────────────────────────────────────────────────────────
 
 /**
  * Get token from the best available account. Backward-compatible.
@@ -285,8 +261,6 @@ export function isAccountThrottled(email: string): boolean {
   return acct.throttledUntil > Date.now();
 }
 
-// ─── Token Refresh ──────────────────────────────────────────────────────────────
-
 async function tryRefreshToken(acct: AccountEntry): Promise<boolean> {
   if (!acct.state?.refreshToken) return false;
 
@@ -314,21 +288,18 @@ async function tryRefreshToken(acct: AccountEntry): Promise<boolean> {
         };
         await saveCookies(acct.email, acct.state.token, acct.state.refreshToken, acct.state.expiresAt);
         if (acct.throttledUntil > Date.now()) {
-          console.log(`[Auth] ✓ Token refreshed for ${acct.email} — clearing throttle`);
           acct.throttledUntil = 0;
         } else {
-          console.log(`[Auth] ✓ Token refreshed for ${acct.email}`);
         }
         return true;
       }
     }
 
-    console.log(`[Auth] HTTP refresh failed for ${acct.email} — falling back to profile-based refresh`);
+    console.error(`[Auth] HTTP refresh failed for ${acct.email} — falling back to profile-based refresh`);
     try {
       const { refreshViaProfile } = await import('./playwright.ts');
       const profileResult = await refreshViaProfile(acct.email);
       if (profileResult) {
-        console.log(`[Auth] ✓ Token refreshed via profile for ${acct.email}`);
         return true;
       }
     } catch (profileErr: any) {
@@ -341,7 +312,7 @@ async function tryRefreshToken(acct: AccountEntry): Promise<boolean> {
       const { refreshViaProfile } = await import('./playwright.ts');
       const profileResult = await refreshViaProfile(acct.email);
       if (profileResult) {
-        console.log(`[Auth] ✓ Token refreshed via profile for ${acct.email} (after network error)`);
+        console.error(`[Auth] ✓ Token refreshed via profile for ${acct.email} (after network error)`);
         return true;
       }
     } catch {}
@@ -362,7 +333,6 @@ async function ensureAccountFresh(acct: AccountEntry): Promise<boolean> {
   acct.refreshInFlight = (async () => {
     try {
       if (acct.state?.refreshToken) {
-        console.log(`[Auth] Refreshing token for ${acct.email}...`);
         if (await tryRefreshToken(acct)) return true;
         console.warn(`[Auth] Refresh token failed for ${acct.email}`);
       }
@@ -373,7 +343,6 @@ async function ensureAccountFresh(acct: AccountEntry): Promise<boolean> {
         return false;
       }
 
-      console.log(`[Auth] Attempting fresh login for ${acct.email}...`);
       const newState = await loginFresh(acct.email, acct.password);
       if (newState) {
         acct.state = newState;
@@ -387,8 +356,6 @@ async function ensureAccountFresh(acct: AccountEntry): Promise<boolean> {
 
   return acct.refreshInFlight;
 }
-
-// ─── Login ──────────────────────────────────────────────────────────────────────
 
 // Lock to serialize browser-context logins (only one activePage, cookie clearing is global)
 const loginMutex = new LoginMutex();
@@ -432,7 +399,6 @@ async function loginFreshViaBrowser(email: string, hashedPassword: string): Prom
       console.warn(`[Auth] Cookie clearing failed for ${email}: ${err.message}`);
     }
 
-    // Execute signin API call inside the browser context
     let evalResult: { ok: boolean; status: number; token: string | null; refreshToken: string | null; dataKeys: string[] };
     try {
       evalResult = await page.evaluate(async ({ email, hashedPassword }: { email: string; hashedPassword: string }) => {
@@ -510,7 +476,6 @@ async function loginFreshViaBrowser(email: string, hashedPassword: string): Prom
         expiresAt: Date.now() + AUTH_TOKEN_MAX_AGE_MS,
         refreshToken: finalRefresh,
       };
-      console.log(`[Auth] Login successful for ${email} (token from ${evalResult.token ? 'response' : 'cookie'})`);
       return state;
     }
 
@@ -529,7 +494,7 @@ async function loginFreshViaBrowser(email: string, hashedPassword: string): Prom
  * Login via plain fetch — fallback for when Playwright is not available (test mode).
  */
 async function loginFreshViaFetch(email: string, hashedPassword: string): Promise<AuthState | null> {
-  const { controller, cleanup } = createAuthFetchTimeout();
+  const { controller, cleanup: _cleanup } = createAuthFetchTimeout();
   try {
     const response = await fetch('https://chat.qwen.ai/api/v2/auths/signin', {
       method: 'POST',
@@ -574,14 +539,12 @@ async function loginFreshViaFetch(email: string, hashedPassword: string): Promis
           expiresAt: Date.now() + AUTH_TOKEN_MAX_AGE_MS,
           refreshToken,
         };
-        console.log(`[Auth] Login successful for ${email}`);
         return state;
       }
 
       // In fetch fallback mode, check Playwright session as last resort
       const hasPlaywrightSession = await checkPlaywrightSession();
       if (hasPlaywrightSession) {
-        console.log(`[Auth] ${email}: API returned no token but Playwright session is valid (cookie-based auth)`);
         return {
           token: '',
           expiresAt: Date.now() + AUTH_TOKEN_MAX_AGE_MS,
@@ -667,7 +630,6 @@ async function loginViaTempContext(
         expiresAt: Date.now() + AUTH_TOKEN_MAX_AGE_MS,
         refreshToken: capturedRefresh,
       };
-      console.log(`[Auth] Login successful for ${email} (temp context)`);
       return state;
     }
 
@@ -690,7 +652,6 @@ async function loginViaTempContext(
  */
 export async function loginFresh(email: string, password: string): Promise<AuthState | null> {
   const hashedPassword = crypto.createHash('sha256').update(password).digest('hex');
-  console.log(`[Auth] Logging in as ${email}...`);
 
   // Browser path: use getActivePage().evaluate() for proper WAF headers + cookie capture
   if (!process.env.TEST_MOCK_PLAYWRIGHT) {
@@ -726,8 +687,6 @@ export async function loginFresh(email: string, password: string): Promise<AuthS
   return fetchResult;
 }
 
-// ─── Initialization ─────────────────────────────────────────────────────────────
-
 export async function initAuth(): Promise<void> {
   if (initDone) return;
   initDone = true;
@@ -753,8 +712,6 @@ export async function initAuth(): Promise<void> {
     return;
   }
 
-  console.log(`[Auth] Initializing ${merged.length} account(s)...`);
-
   accounts = merged.map((a: { email: string; password: string }) => ({
     email: a.email,
     password: a.password,
@@ -777,15 +734,12 @@ export async function initAuth(): Promise<void> {
     const savedState = await loadSavedCookies(acct.email);
     if (savedState) {
       acct.state = savedState;
-      console.log(`[Auth] ✓ ${acct.email}`);
     } else if (acct.password) {
       const newState = await loginFresh(acct.email, acct.password);
       if (newState) {
         acct.state = newState;
         await saveCookies(acct.email, newState.token, newState.refreshToken, newState.expiresAt);
-        console.log(`[Auth] Auto-login: ${acct.email} ✓`);
       } else {
-        console.log(`[Auth] Auto-login: ${acct.email} ✗`);
       }
     }
 
@@ -796,12 +750,10 @@ export async function initAuth(): Promise<void> {
 
   // Report results
   const successCount = accounts.filter(a => a.state !== null && a.state.token).length;
-  console.log(`[Auth] ${successCount}/${accounts.length} account(s) authenticated successfully.`);
   logStore.log('info', 'auth', successCount + '/' + accounts.length + ' accounts authenticated');
   
   for (const acct of accounts) {
     const status = acct.state?.token ? '✓' : '✗';
-    console.log(`[Auth]   ${status} ${acct.email}`);
   }
 
   setupAccountWatcher();
@@ -815,9 +767,7 @@ export async function autoLoginAllAccounts(): Promise<void> {
     if (newState) {
       acct.state = newState;
       await saveCookies(acct.email, newState.token, newState.refreshToken, newState.expiresAt);
-      console.log(`[Auth] Auto-login: ${acct.email} ✓`);
     } else {
-      console.log(`[Auth] Auto-login: ${acct.email} ✗`);
     }
     if (i < accounts.length - 1) {
       await new Promise(r => setTimeout(r, 2000));
@@ -833,8 +783,6 @@ export async function ensureAllFresh(): Promise<void> {
   if (stale.length === 0) return;
   await Promise.allSettled(stale.map(a => ensureAccountFresh(a)));
 }
-
-// ─── Stats ──────────────────────────────────────────────────────────────────────
 
 export function getAccountStats(): Array<{
   email: string;
@@ -878,8 +826,6 @@ export function getAllAccountEmails(): string[] {
 export function getAccounts(): readonly AccountEntry[] {
   return [...accounts];
 }
-
-// ─── Per-Account Cookie Store ───────────────────────────────────────────
 
 const COOKIE_DIR = 'qwen_profile/cookies';
 const ACCOUNTS_FILE = 'qwen_profile/accounts.json';
@@ -941,16 +887,13 @@ export async function loadSavedCookies(email: string): Promise<AuthState | null>
     // JWT's embedded `exp` claim is authoritative — check it first
     const payload = decodeJwt(data.token);
     if (payload?.exp && payload.exp * 1000 < Date.now()) {
-      console.log(`[Auth] JWT for ${email} expired at ${new Date(payload.exp * 1000).toISOString()}, will try refresh/login`);
       return null;
     }
 
     // Local expiresAt is a secondary check (may be shorter than real JWT lifetime)
     if (data.expiresAt < Date.now()) {
-      console.log(`[Auth] Saved token for ${email} locally expired but JWT is still valid, accepting`);
     }
 
-    console.log(`[Auth] Loaded saved token for ${email} (expires in ${Math.round((payload?.exp ? (payload.exp * 1000 - Date.now()) : (data.expiresAt - Date.now())) / 60000)}min)`);
     return {
       token: data.token,
       expiresAt: data.expiresAt,
@@ -1002,13 +945,10 @@ export async function saveCookies(email: string, token: string, refreshToken?: s
       }
     }
 
-    console.log(`[Auth] Saved token for ${normalizedEmail}`);
   } catch (err: any) {
     console.error(`[Auth] Failed to save cookies for ${normalizedEmail}: ${err.message}`);
   }
 }
-
-// ─── Hot-Reload ──────────────────────────────────────────────────────────────────
 
 let accountWatcher: FSWatcher | null = null;
 let reloadDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1022,7 +962,6 @@ let watcherReady = false;
  */
 export async function reloadAccounts(): Promise<void> {
   if (accountWatcher && !watcherReady) {
-    console.log('[Auth] Hot-reload: skipping (startup grace period)');
     return;
   }
   const discovered = discoverSavedAccounts();
@@ -1052,7 +991,6 @@ export async function reloadAccounts(): Promise<void> {
       }
       accounts.push(entry);
       added++;
-      console.log(`[Auth] Hot-reload: added ${email}`);
     }
   }
 
@@ -1061,21 +999,17 @@ export async function reloadAccounts(): Promise<void> {
     if (!discoveredEmails.has(acct.email.toLowerCase().trim())) {
       const cookieFile = getCookieFilePath(acct.email);
       if (existsSync(cookieFile)) {
-        console.log(`[Auth] Hot-reload: keeping ${acct.email} (file exists but may be mid-write)`);
         continue;
       }
       if (acct.inFlight > 0) {
-        console.log(`[Auth] Hot-reload: skipping removal of ${acct.email} (inFlight=${acct.inFlight})`);
         continue;
       }
       accounts.splice(i, 1);
       removed++;
-      console.log(`[Auth] Hot-reload: removed ${acct.email}`);
     }
   }
 
   const unchanged = accounts.length - added;
-  console.log(`[Auth] Hot-reload: +${added} new, -${removed} removed, ${unchanged} unchanged`);
 }
 
 /**
@@ -1109,12 +1043,10 @@ export function setupAccountWatcher(): void {
       watcherReady = false;
       // Schedule restart in 10 seconds
       setTimeout(() => {
-        console.log('[Auth] Attempting to restart account watcher...');
         setupAccountWatcher();
       }, 10000).unref();
     });
 
-    console.log(`[Auth] Watching ${COOKIE_DIR} for account changes`);
     setTimeout(() => { watcherReady = true; }, 2000);
   } catch (err: any) {
     console.error(`[Auth] Failed to set up account watcher: ${err.message}`);
@@ -1128,10 +1060,6 @@ export function setupAccountWatcher(): void {
 export function enableHotReload(): void {
   setupAccountWatcher();
 }
-
-// ─── Account File Persistence ───────────────────────────────────────────────────
-
-
 
 function saveAccountsToFile(): void {
   const dir = path.dirname(ACCOUNTS_FILE);
@@ -1156,8 +1084,6 @@ function loadAccountsFromFile(): Array<{ email: string; password: string }> {
     return [];
   }
 }
-
-// ─── Account CRUD Operations ────────────────────────────────────────────────────
 
 export async function addAccount(email: string, password: string): Promise<{ loginSucceeded: boolean; loginError?: string }> {
   const normalizedEmail = email.toLowerCase().trim();
@@ -1185,7 +1111,6 @@ export async function addAccount(email: string, password: string): Promise<{ log
   if (newState) {
     entry.state = newState;
     await saveCookies(normalizedEmail, newState.token, newState.refreshToken, newState.expiresAt);
-    console.log(`[Auth] Added and logged in: ${normalizedEmail}`);
     return { loginSucceeded: true };
   } else {
     const msg = `Login failed: wrong password or CAPTCHA required for ${normalizedEmail}. Check system logs.`;
@@ -1217,16 +1142,12 @@ export async function removeAccount(email: string): Promise<void> {
   if (existsSync(profileDir)) {
     try {
       rmSync(profileDir, { recursive: true, force: true });
-      console.log(`[Auth] Deleted Chromium profile for ${normalizedEmail}`);
     } catch (err: any) {
       console.error(`[Auth] Failed to delete Chromium profile for ${normalizedEmail}:`, err.message);
     }
   }
 
-  console.log(`[Auth] Removed account: ${normalizedEmail}`);
 }
-
-// ─── Backward Compatibility ─────────────────────────────────────────────────────
 
 export function clearAuth(): void {
   accounts = [];

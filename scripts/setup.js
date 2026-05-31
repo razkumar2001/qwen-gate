@@ -32,7 +32,9 @@ function hostsEntry() {
         console.log(`  ✅ ${HOSTNAME} already in hosts`);
       }
     }
-  } catch {}
+  } catch {
+    // intentional: hosts file modification failure is non-blocking, skip silently
+  }
 }
 
 function portRedirect() {
@@ -64,7 +66,7 @@ function portRedirect() {
       const rule = `rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port 80 -> 127.0.0.1 port ${portNum}`;
       try {
         writeFileSync(anchorFile, rule + '\n');
-        execSync(`pfctl -Ef /etc/pf.conf 2>/dev/null; echo \"rdr-anchor \\\"qwen-gate\\\"\" >> /tmp/qwen-pf.conf; pfctl -a qwen-gate -f ${anchorFile} 2>/dev/null`, { stdio: 'pipe', timeout: 5000 });
+        execSync(`pfctl -Ef /etc/pf.conf 2>/dev/null; echo "rdr-anchor \\"qwen-gate\\"" >> /tmp/qwen-pf.conf; pfctl -a qwen-gate -f ${anchorFile} 2>/dev/null`, { stdio: 'pipe', timeout: 5000 });
         console.log(`  ✅ Port 80 → ${portNum} redirect active (macOS pfctl)`);
       } catch (e) {
         console.log(`  ⚠ Could not set up pf redirect: ${e.message}`);
@@ -121,7 +123,9 @@ function opencodeConfig() {
           writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
           console.log(`  ✅ Set qwen-gate as default`);
         }
-      } catch {}
+      } catch {
+        // intentional: OpenCode config parse failure is non-blocking, skip silently
+      }
     }
 
     const authPath = join(homedir(), '.local', 'share', 'opencode', 'auth.json');
@@ -134,9 +138,13 @@ function opencodeConfig() {
           writeFileSync(authPath, JSON.stringify(auth, null, 2) + '\n');
           console.log('  ✅ Added credential to OpenCode');
         }
-      } catch {}
+      } catch {
+        // intentional: OpenCode auth parse failure is non-blocking, skip silently
+      }
     }
-  } catch {}
+  } catch {
+    // intentional: top-level setup failure is non-blocking, skip silently
+  }
 }
 
 function main() {

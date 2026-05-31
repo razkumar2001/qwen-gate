@@ -54,8 +54,6 @@ export class AttemptTimeoutError extends Error {
   }
 }
 
-// ─── Circuit Breaker ────────────────────────────────────────────────────────────
-
 export type CircuitState = 'closed' | 'open' | 'half_open';
 
 export interface CircuitBreakerConfig {
@@ -89,7 +87,7 @@ export class CircuitBreaker {
     if (this.state === 'open' && Date.now() - this.lastFailureTime >= this.resetTimeoutMs) {
       this.state = 'half_open';
       this.successCount = 0;
-      console.log(`[CircuitBreaker:${this.name}] open → half_open (reset timeout elapsed)`);
+      console.error(`[CircuitBreaker:${this.name}] open → half_open (reset timeout elapsed)`);
     }
     return this.state;
   }
@@ -119,7 +117,6 @@ export class CircuitBreaker {
       if (this.successCount >= this.halfOpenMaxAttempts) {
         this.state = 'closed';
         this.failureCount = 0;
-        console.log(`[CircuitBreaker:${this.name}] half_open → closed (recovered)`);
       }
     } else {
       // Reset on success in closed state
@@ -133,7 +130,7 @@ export class CircuitBreaker {
     if (this.state === 'half_open') {
       // Immediate re-open on any failure in half-open
       this.state = 'open';
-      console.log(`[CircuitBreaker:${this.name}] half_open → open (probe failed)`);
+      console.error(`[CircuitBreaker:${this.name}] half_open → open (probe failed)`);
     } else {
       this.failureCount++;
       if (this.failureCount >= this.failureThreshold) {
@@ -282,11 +279,6 @@ export function getRetryConfigFromEnv(): Required<RetryConfig> {
   return { ...DEFAULT_CONFIG, ...envConfig };
 }
 
-/**
- * Wraps an async function with retry logic.
- * Retries on transient errors with exponential backoff.
- * Supports per-attempt timeout and optional circuit breaker.
- */
 export async function withRetry<T>(
   fn: () => Promise<T>,
   config?: RetryConfig

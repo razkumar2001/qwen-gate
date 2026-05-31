@@ -251,6 +251,34 @@ describe('Streaming tool call leak prevention (02.md fix)', () => {
       `Tool name leaked into content: "${accumulatedContent}"`);
   });
 
+  it('S5: 4 consecutive tool calls with shared prefix — all extracted, no text leak', async () => {
+    const { detectCumulativeChunk } = await import('../routes/chat.ts');
+    
+    const call1 = '{"name": "bash", "arguments": {"command": "date", "description": "Show current date"}}';
+    const call2 = '{"name": "bash", "arguments": {"command": "uname -a", "description": "Show system info"}}';
+    const call3 = '{"name": "bash", "arguments": {"command": "whoami", "description": "Show current user"}}';
+    const call4 = '{"name": "bash", "arguments": {"command": "uptime", "description": "Show system uptime"}}';
+    
+    const shared = '{"name": "bash", "arguments": {"command": "';
+    
+    const d1 = detectCumulativeChunk(call2, call1);
+    assert.equal(d1.cumulative, false, `call1→call2 must NOT be cumulative (got delta: "${d1.delta}")`);
+    
+    const d2 = detectCumulativeChunk(call3, call2);
+    assert.equal(d2.cumulative, false, `call2→call3 must NOT be cumulative`);
+    
+    const d3 = detectCumulativeChunk(call4, call3);
+    assert.equal(d3.cumulative, false, `call3→call4 must NOT be cumulative`);
+    
+    const d4 = detectCumulativeChunk(shared, call1);
+    assert.equal(d4.cumulative, false, `partial prefix must NOT be cumulative`);
+    
+    const cumulativeNew = call1 + '\n' + call2;
+    const d5 = detectCumulativeChunk(cumulativeNew, call1);
+    assert.equal(d5.cumulative, true, 'genuinely cumulative text should be detected');
+    assert.equal(d5.delta, '\n' + call2, 'delta should be the appended content');
+  });
+
   it('S4: malformed tool call JSON does not leak', () => {
     // Edge case: what if delta.content contains malformed JSON?
     // After fix: this shouldn't happen (tool calls in delta.tool_calls[])

@@ -58,19 +58,10 @@ export function robustParseJSON(str: string): any {
     return JSON.parse(trimmed);
   } catch {} // expected — fall through to progressive repair below
 
-  // Strip markdown code fences in all variants
-  let sanitized = trimmed;
-  const fenceMatch = sanitized.match(/\x60\x60\x60(?:json|JSON)?\s*\n?([\s\S]*?)\n?\s*\x60\x60\x60/);
-  if (fenceMatch) {
-    sanitized = fenceMatch[1].trim();
-  } else {
-    sanitized = sanitized.replace(/^\x60\x60\x60(?:json|JSON)?\s*/i, '').replace(/\x60\x60\x60\s*$/, '').trim();
-  }
-
-  const firstBrace = sanitized.indexOf('{');
+  const firstBrace = trimmed.indexOf('{');
   if (firstBrace === -1) return null;
 
-  const jsonPart = sanitized.substring(firstBrace);
+  const jsonPart = trimmed.substring(firstBrace);
 
   try {
     return JSON.parse(jsonPart);
@@ -92,7 +83,7 @@ export function robustParseJSON(str: string): any {
 
   try {
     return JSON.parse(currentJson);
-  } catch (e) {
+  } catch (_e) {
     // Still fails, continue to more complex fixes
   }
 
@@ -248,7 +239,7 @@ export function robustParseJSON(str: string): any {
     
     try {
       return JSON.parse(aggFixed);
-    } catch (e2) {
+    } catch (_e2) {
       throw e; // Throw original error if all fixes fail
     }
   }

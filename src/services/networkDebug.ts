@@ -76,7 +76,7 @@ function notifyListeners(entry: NetworkDebugEntry): void {
   for (const listener of listeners) {
     try {
       listener(entry);
-    } catch (error) {
+    } catch (_error) {
       // Silently ignore listener errors to prevent breaking the main flow
     }
   }
@@ -162,7 +162,6 @@ export function recordStreamChunk(entryId: string, chunk: string): void {
   
   const now = new Date().toISOString();
   
-  // Update phase to streaming on first chunk
   if (entry.stream.totalChunks === 0) {
     entry.phase = 'streaming';
     entry.stream.firstChunkAt = now;
@@ -225,7 +224,6 @@ export function getNetworkEntry(id: string): NetworkDebugEntry | undefined {
 export function subscribeNetwork(listener: (entry: NetworkDebugEntry) => void): () => void {
   listeners.add(listener);
   
-  // Return unsubscribe function
   return () => {
     listeners.delete(listener);
   };

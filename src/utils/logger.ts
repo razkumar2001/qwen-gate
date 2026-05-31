@@ -1,6 +1,3 @@
-// ─── Structured Logger ──────────────────────────────────────────────────────────
-// JSON structured logger with levels, timestamps, and context fields.
-// Replaces raw console.log/error calls in critical paths.
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 

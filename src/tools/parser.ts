@@ -30,8 +30,6 @@ export interface ParserResult {
 const MAX_BUFFER_SIZE = 65536;
 /** How much context to keep when trimming buffer */
 const TRIM_KEEP_CONTEXT = 4096;
-/** Maximum search distance backward from "name" to find opening brace */
-const MAX_BRACE_SEARCH_DISTANCE = 500;
 
 export class StreamingToolParser {
   private buffer = '';
@@ -48,18 +46,8 @@ export class StreamingToolParser {
       return { text: chunk, toolCalls: [], thinking: '' };
     }
 
-    if (!this.skipPreProcess) {
-      chunk = this.preprocess(chunk);
-    }
-
     this.buffer += chunk;
     return this.extract();
-  }
-
-  private preprocess(chunk: string): string {
-    chunk = chunk.replace(/`{3}(?:json|JSON)?\s*/g, '').replace(/`{3}\s*/g, '');
-    chunk = chunk.replace(/<\/?(?:tool_call|tool_use|function_call|function_calls|tools?)\s*>/gi, '');
-    return chunk;
   }
 
   private extract(): ParserResult {
@@ -67,20 +55,6 @@ export class StreamingToolParser {
     let offset = 0;
 
     while (offset < this.buffer.length) {
-      // ── Handle <think> / <thinking> blocks ─────────────────────────────
-      const thinkResult = this.extractThinkBlock(offset);
-      if (thinkResult) {
-        result.thinking += thinkResult.content;
-        offset = thinkResult.endOffset;
-        this.textEmissionBoundary = offset;
-        continue;
-      }
-
-      // If we see an incomplete <think> or <thinking> tag at the end, wait
-      if (this.hasIncompleteThinkTag(offset)) {
-        break;
-      }
-
       // ── Look for JSON objects ──────────────────────────────────────────
       const nextBraceQuote = this.buffer.indexOf('{"', offset);
       const nextBraceBracket = this.buffer.indexOf('[{', offset);
@@ -111,7 +85,6 @@ export class StreamingToolParser {
         this.textEmissionBoundary = jsonStart;
       }
 
-      // Handle array-wrapped tool calls
       if (isArray) {
         const arrayResult = this.extractArrayToolCalls(jsonStart);
         if (arrayResult) {
@@ -127,19 +100,16 @@ export class StreamingToolParser {
         continue;
       }
 
-      // Handle single JSON object
       const after = this.buffer.substring(jsonStart);
       const jsonEnd = this.findJsonEnd(after);
 
       if (jsonEnd === -1) {
-        // Incomplete JSON — suppress and wait for more chunks
         this.textEmissionBoundary = jsonStart;
         break;
       }
 
       const jsonStr = after.substring(0, jsonEnd);
 
-      // Quick check: does this look like a tool call?
       if (this.looksLikeToolCall(jsonStr)) {
         try {
           const parsed = robustParseJSON(jsonStr);
@@ -153,12 +123,16 @@ export class StreamingToolParser {
               continue;
             }
           }
+          offset = jsonStart + jsonEnd;
+          this.textEmissionBoundary = Math.max(this.textEmissionBoundary, offset);
+          continue;
         } catch {
-          // Parse failed — drop the fragment, don't emit as text
+          offset = jsonStart + 1;
+          this.textEmissionBoundary = jsonStart;
+          continue;
         }
       }
 
-      // Not a valid tool call — skip past this JSON and continue
       offset = jsonStart + jsonEnd;
       this.textEmissionBoundary = Math.max(this.textEmissionBoundary, offset);
       continue;
@@ -279,7 +253,6 @@ export class StreamingToolParser {
           // Skip escape sequence
           i++;
           if (i >= buf.length) return -1;
-          // Handle \uXXXX unicode escapes
           if (buf[i] === 'u') {
             // Need 4 hex digits
             if (i + 4 >= buf.length) return -1;
@@ -336,7 +309,6 @@ export class StreamingToolParser {
     const trimmedName = name.trim();
     if (!trimmedName) return null;
 
-    // Handle stringified arguments
     if (typeof args === 'string') {
       try {
         args = JSON.parse(args);
@@ -400,7 +372,6 @@ export class StreamingToolParser {
       // Try one final pass to extract tool calls from remaining buffer
       while (true) {
 
-
         const braceIdx = remaining.indexOf('{');
         if (braceIdx === -1) break;
 
@@ -445,7 +416,6 @@ export class StreamingToolParser {
       result.text += remaining;
     }
 
-    // Reset state
     this.buffer = '';
     this.emittedCount = 0;
     this.textEmissionBoundary = 0;

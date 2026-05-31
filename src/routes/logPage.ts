@@ -393,7 +393,7 @@ function toggleFold(header) {
 }
 
 /* ── State ── */
-var MAX_REQUEST_ENTRIES = 500; // Match backend limit
+var MAX_REQUEST_ENTRIES = 10;
 var RENDER_LIMIT_INITIAL = 50; // Show 50 entries initially
 var renderLimit = RENDER_LIMIT_INITIAL;
 var requestEntries = [];
@@ -840,7 +840,6 @@ function setText(id, val) {
 
 /* ── Init ── */
 function init() {
-  // Get baseline uptime from /health and compute locally
   apiFetch('/health').then(function(data) {
     if (data && data.uptime != null) {
       var startTime = Date.now() - (data.uptime * 1000);
