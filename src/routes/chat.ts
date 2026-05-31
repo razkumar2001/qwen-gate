@@ -1026,6 +1026,7 @@ const result = await createQwenStream(finalPrompt, isThinkingModel, routedModel,
       let currentAppendPath = '';
       
       let reasoningBuffer = '';
+      let deferredThinkingChunks: string[] = [];
       let lastFullContent = '';
       let lastRawContent = '';  // pre-parser cumulative tracking
       // Snapshot-based diffing: track the full filtered text from the previous
@@ -1170,13 +1171,7 @@ const result = await createQwenStream(finalPrompt, isThinkingModel, routedModel,
               if (isThinkingChunk) {
                 inThinkingState = true;
                 reasoningBuffer += vStr;
-                await writeEvent({
-                  id: completionId,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: body.model,
-                  choices: [makeChoice({ reasoning_content: vStr })]
-                });
+                deferredThinkingChunks.push(vStr);
               } else {
                 inThinkingState = false;
                 // Strip stray tag closers that arrive as separate chunks after the
@@ -1305,6 +1300,17 @@ const result = await createQwenStream(finalPrompt, isThinkingModel, routedModel,
 
                   break;
                 }
+
+                for (const chunk of deferredThinkingChunks) {
+                  await writeEvent({
+                    id: completionId,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: body.model,
+                    choices: [makeChoice({ reasoning_content: chunk })]
+                  });
+                }
+                deferredThinkingChunks = [];
 
                 // Apply echo filter to the full accumulated text (not per-chunk fragments).
                 // The shingle algorithm needs complete lines to detect echoes reliably;
