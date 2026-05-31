@@ -148,7 +148,10 @@ export async function getBasicHeaders(email?: string): Promise<BasicHeaders> {
   // P0: Use cached userAgent (never changes during browser lifetime)
   if (!cachedUserAgent) {
     for (const accCtx of accountContexts.values()) {
-      cachedUserAgent = await accCtx.page.evaluate(() => navigator.userAgent, { timeout: 10_000 } as any);
+      cachedUserAgent = await Promise.race([
+        accCtx.page.evaluate(() => navigator.userAgent),
+        new Promise<string>((_, reject) => setTimeout(() => reject(new Error('UserAgent timeout')), 10_000)),
+      ]);
       break;
     }
     if (!cachedUserAgent) {
@@ -257,8 +260,8 @@ export async function createAccountContext(email: string, cookies?: Record<strin
   if (process.env.TEST_MOCK_PLAYWRIGHT) {
     // Mock context for testing
     return {
-      context: null as any,
-      page: null as any,
+      context: null as unknown as BrowserContext,
+      page: null as unknown as Page,
       lastRefresh: Date.now(),
       cookies: cookies || {},
       headers: {}
@@ -560,7 +563,7 @@ async function captureBxHeaders(accCtx: AccountContext): Promise<void> {
         method: 'GET',
         headers: { 'accept': 'application/json', 'source': 'web' },
       }).catch(() => {});
-    }, { timeout: 10000 } as any);
+    });
     await sleep(500);
   } catch (err: any) {
     console.warn(`[AccountContext] bx-header capture fetch failed: ${err.message}`);
@@ -609,7 +612,7 @@ export async function openBrowserProfile(email: string, password?: string, optio
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
       Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-      (window as any).chrome = { runtime: {} };
+      Object.defineProperty(window, 'chrome', { value: { runtime: {} }, configurable: true });
       const origQuery = navigator.permissions.query;
       navigator.permissions.query = (params: any) =>
         params.name === 'notifications'
@@ -733,7 +736,7 @@ export async function refreshViaProfile(email: string): Promise<boolean> {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
       Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-      (window as any).chrome = { runtime: {} };
+      Object.defineProperty(window, 'chrome', { value: { runtime: {} }, configurable: true });
     });
 
     const page = context.pages()[0] || await context.newPage();

@@ -79,7 +79,7 @@ async function gracefulShutdown(_signal: string): Promise<void> {
   }
   isShuttingDown = true;
   if (serverInstance) {
-    try { (serverInstance as any).close?.(); } catch {
+    try { serverInstance.close(); } catch {
       // intentional: server close failure during shutdown is non-blocking, continue cleanup
     }
   }
@@ -250,7 +250,7 @@ app.get('/log/stream', (c) => {
           if (!alive) { clearInterval(heartbeat); return; }
           if (!safeEnqueue(': ping\n\n')) { clearInterval(heartbeat); }
         }, 15000);
-        if (typeof (heartbeat as any).unref === 'function') (heartbeat as any).unref();
+        heartbeat.unref();
 
         // Subscribe to new log entries
         const unsub = logStore.subscribe((entry) => {
