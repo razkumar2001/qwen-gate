@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import modelSpecs from '../models.json' with { type: 'json' };
 import { modelRouter } from '../services/modelRouter.ts';
 import { buildFeatureConfig, createQwenStream } from '../services/qwen.ts';
+import { config } from '../services/configService.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import type { ModelSpec } from '../types/openai.ts';
 import { THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
@@ -169,16 +170,49 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
   const featureConfig = buildFeatureConfig(true);
 
   if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
-    const localMcp: Record<string, any> = {};
-    localMcp['★'] = {};
-    for (const t of body.tools) {
-      const fn = t.function || {};
-      localMcp['★'][fn.name] = {
-        description: fn.description || '',
-        input_schema: fn.parameters || { type: 'object', properties: {} },
-      };
+    const mode = config.get('TOOL_CALLING_MODE', 'xml_prompt');
+
+    if (mode === 'local_mcp') {
+      // Original behaviour: inject via feature_config.local_mcp (native Qwen API).
+      // Broken on chat.qwen.ai as of mid-2026 — returns 500 Internal_Server_Error.
+      // Kept for users whose Qwen deployments still support this path.
+      const localMcp: Record<string, any> = {};
+      localMcp['★'] = {};
+      for (const t of body.tools) {
+        const fn = t.function || {};
+        localMcp['★'][fn.name] = {
+          description: fn.description || '',
+          input_schema: fn.parameters || { type: 'object', properties: {} },
+        };
+      }
+      featureConfig.local_mcp = localMcp;
+    } else {
+      // xml_prompt (default): inject tools as XML instructions in the user prompt.
+      // Model outputs <function=NAME><parameter=K>V</parameter></function> blocks
+      // which the existing xmlToolParser converts back to OpenAI tool_calls format.
+      const toolDefs = body.tools.map((t: any) => {
+        const fn = t.function || {};
+        const props = fn.parameters?.properties || {};
+        const required = fn.parameters?.required || [];
+        const paramLines: string[] = [];
+        for (const [k, v] of Object.entries(props) as [string, any][]) {
+          const req = required.includes(k) ? ' (required)' : '';
+          paramLines.push(`  <parameter=${escXml(k)}>${escXml(v.description || v.type || 'string')}${req}</parameter>`);
+        }
+        return `<function=${escXml(fn.name)}>\n  <description>${escXml(fn.description || '')}</description>\n${paramLines.join('\n')}\n</function>`;
+      }).join('\n\n');
+
+      const toolPrompt =
+        '\n\n## AVAILABLE TOOLS — YOU MUST USE XML FORMAT TO CALL THEM\n\n' +
+        toolDefs + '\n\n' +
+        'TO CALL A TOOL, OUTPUT EXACTLY THIS FORMAT AND NOTHING ELSE AFTER:\n' +
+        '<function=TOOL_NAME>\n<parameter=PARAM1>value1</parameter>\n</function>\n' +
+        'After outputting </function>, STOP. Do not add any text after the closing tag.\n' +
+        'This is a function-calling environment. Tool results will be returned to you.';
+
+      // Prepend to prompt so model sees it inline, not as file attachment
+      prompt = toolPrompt + (prompt ? '\n' + prompt : '');
     }
-    featureConfig.local_mcp = localMcp;
   }
 
   // Single message (Qwen API only accepts 1 message per chat)
