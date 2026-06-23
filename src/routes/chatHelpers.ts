@@ -187,28 +187,41 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
       }
       featureConfig.local_mcp = localMcp;
     } else {
-      // xml_prompt (default): inject tools as XML instructions in the user prompt.
-      // Model outputs <function=NAME><parameter=K>V</parameter></function> blocks
-      // which the existing xmlToolParser converts back to OpenAI tool_calls format.
+      // xml_prompt (default): inject tool DEFINITIONS using a DISTINCT tag
+      // (<tool name=..>) so they never collide with the <function=NAME>
+      // INVOCATION tag that xmlToolParser matches. The model is instructed to
+      // CALL tools with <function=NAME><parameter=K>V</parameter></function>,
+      // which the parser converts back to OpenAI tool_calls.
+      //
+      // Why distinct tags: past assistant tool_calls in multi-turn history are
+      // also serialized as <function=NAME>..</function> (see assistant branch
+      // above). If definitions ALSO used <function=NAME>, the prompt would
+      // contain three things sharing one tag — definitions, past calls, and the
+      // call-format instruction — and the model conflates them, hallucinating
+      // "Tool X does not exist". A separate <tool> tag removes the ambiguity.
       const toolDefs = body.tools.map((t: any) => {
         const fn = t.function || {};
         const props = fn.parameters?.properties || {};
         const required = fn.parameters?.required || [];
-        const paramLines: string[] = [];
+        const argLines: string[] = [];
         for (const [k, v] of Object.entries(props) as [string, any][]) {
           const req = required.includes(k) ? ' (required)' : '';
-          paramLines.push(`  <parameter=${escXml(k)}>${escXml(v.description || v.type || 'string')}${req}</parameter>`);
+          argLines.push(`    <arg name="${escXml(k)}" type="${escXml(v.type || 'string')}">${escXml(v.description || '')}${req}</arg>`);
         }
-        return `<function=${escXml(fn.name)}>\n  <description>${escXml(fn.description || '')}</description>\n${paramLines.join('\n')}\n</function>`;
-      }).join('\n\n');
+        return `  <tool name="${escXml(fn.name)}">\n    <desc>${escXml(fn.description || '')}</desc>\n${argLines.join('\n')}\n  </tool>`;
+      }).join('\n');
 
       const toolPrompt =
-        '\n\n## AVAILABLE TOOLS — YOU MUST USE XML FORMAT TO CALL THEM\n\n' +
-        toolDefs + '\n\n' +
-        'TO CALL A TOOL, OUTPUT EXACTLY THIS FORMAT AND NOTHING ELSE AFTER:\n' +
-        '<function=TOOL_NAME>\n<parameter=PARAM1>value1</parameter>\n</function>\n' +
-        'After outputting </function>, STOP. Do not add any text after the closing tag.\n' +
-        'This is a function-calling environment. Tool results will be returned to you.';
+        '\n\n## AVAILABLE TOOLS\n' +
+        'You can call these tools. Tool definitions (reference only — do NOT copy this format):\n' +
+        '<tools>\n' + toolDefs + '\n</tools>\n\n' +
+        'TO CALL A TOOL, emit EXACTLY this and nothing after the closing tag:\n' +
+        '<function=TOOL_NAME>\n<parameter=ARG_NAME>value</parameter>\n</function>\n\n' +
+        'Rules:\n' +
+        '- Use the tool name from the <tool name="..."> list as TOOL_NAME.\n' +
+        '- One <parameter=...> line per argument you pass.\n' +
+        '- After </function>, STOP immediately. Output no other text.\n' +
+        '- These tools ARE available in this environment. Call them — do not claim they are missing.';
 
       // Prepend to prompt so model sees it inline, not as file attachment
       prompt = toolPrompt + (prompt ? '\n' + prompt : '');
