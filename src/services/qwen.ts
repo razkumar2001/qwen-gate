@@ -107,6 +107,12 @@ export interface QwenStreamResult {
 // Cached timezone for request headers
 const cachedTimezone = 'America/Sao_Paulo';
 
+// Stable per-process device fingerprint for the bx-umidtoken fallback. Using
+// Date.now() here generated a NEW umid on every request -> mismatched device
+// fingerprint -> WAF man-machine challenge. A process-stable value presents one
+// consistent "device" across all requests that lack a real extracted umid.
+const STABLE_ANON_UMID = crypto.createHash('sha256').update(`qwen-gate-${process.pid}`).digest('hex').slice(0, 64);
+
 export function createFetchTimeout(): { controller: AbortController; cleanup: () => void } {
   const controller = new AbortController();
   const timeout = config.getInt('QWEN_FETCH_TIMEOUT_MS', 30000);
@@ -122,7 +128,7 @@ function buildRequestHeaders(reqHeaders: Record<string, string>, cId?: string): 
     reqHeaders['bx-umidtoken'] ||
     crypto
       .createHash('sha256')
-      .update(reqHeaders['cookie'] || `anon-${Date.now()}`)
+      .update(reqHeaders['cookie'] || STABLE_ANON_UMID)
       .digest('hex')
       .slice(0, 64);
   const bxUa =
@@ -266,6 +272,29 @@ export async function createQwenStream(
   async function handleErrorResponse(response: Response, debugEntryId: string): Promise<never> {
     const errText = await response.text().catch(() => '');
     const contentType = response.headers.get('content-type') || '';
+
+    // Baxia WAF often answers a captcha challenge as HTML or a bare 403 rather
+    // than a JSON FAIL_SYS_USER_VALIDATE. The JSON-only branch below missed it
+    // -> generic UpstreamStatusError -> no throttle -> immediate account
+    // re-pick -> repeat challenge. Detect it here and treat as captcha.
+    const looksLikeWafHtml =
+      response.status === 403 ||
+      contentType.includes('text/html') ||
+      /aliyun_waf|<html|man-machine|captcha/i.test(errText);
+    if (looksLikeWafHtml) {
+      const details = `WAF challenge (status ${response.status}, ${contentType || 'no-ct'})`;
+      logStore.log('warn', 'qwen', `CAPTCHA (HTML/403) detected for ${currentAccountEmail || 'unknown'}: ${details}`);
+      if (currentAccountEmail) {
+        throttleAccount(currentAccountEmail, 5 * 60 * 1000);
+        const nextAccount = await pickAccount(currentAccountEmail);
+        if (nextAccount) {
+          currentAccountEmail = nextAccount.email;
+          decrementInFlight(nextAccount.email);
+        }
+      }
+      throw new RetryableQwenStreamError(`Qwen WAF/captcha (HTML/403) — switched accounts. ${details}`, 3000);
+    }
+
     if (contentType.includes('application/json')) {
       try {
         const errorJson = JSON.parse(errText);
