@@ -8,6 +8,10 @@ export interface AuthState {
   token: string;
   expiresAt: number;
   refreshToken: string | null;
+  /** Baxia/WAF session cookies (cna, ssxmod_itna, tfstk, isg, ...) captured
+   *  from the login response set-cookie headers. When present, chat requests
+   *  merge them with token= so steady-state traffic is WAF-warm, not cold. */
+  profileCookies?: string;
 }
 
 export interface AccountEntry {

@@ -124,6 +124,19 @@ async function detectCaptcha(page: any): Promise<boolean> {
   });
 }
 
+/** Build a `name=value; name=value` cookie string from a browser context's
+ *  cookies, capturing the baxia/WAF session cookies (cna, ssxmod_itna, tfstk,
+ *  isg, ...) alongside the token. These get persisted as profileCookies so
+ *  browserless chat requests can merge them with token= and stay WAF-warm
+ *  instead of going cold on every steady-state request. */
+function buildProfileCookies(cookies: Cookie[]): string | undefined {
+  const wafNames = /^(cna|ssxmod_itna|tfstk|isg|acw_tc|xlly_s|baxia|mtop|csgo)$/i;
+  const pairs = cookies
+    .filter((c) => c.value && (wafNames.test(c.name) || c.name === 'token' || c.name.toLowerCase().includes('refresh')))
+    .map((c) => `${c.name}=${c.value}`);
+  return pairs.length ? pairs.join('; ') : undefined;
+}
+
 async function tryCheckToken(context: any, email: string): Promise<LoginResult | null> {
   try {
     const cookies: Cookie[] = await context.cookies();
@@ -131,7 +144,7 @@ async function tryCheckToken(context: any, email: string): Promise<LoginResult |
     if (!tokenCookie) return null;
     const { saveCookies } = await import('./auth.ts');
     const refreshCookie = cookies.find((c: Cookie) => c.name.toLowerCase().includes('refresh'));
-    await saveCookies(email, tokenCookie.value, refreshCookie?.value);
+    await saveCookies(email, tokenCookie.value, refreshCookie?.value, undefined, buildProfileCookies(cookies));
     try {
       await context.close();
     } catch {
@@ -256,7 +269,7 @@ export async function refreshViaProfile(email: string): Promise<boolean> {
       if (tokenCookie && tokenCookie.expires && tokenCookie.expires * 1000 > Date.now()) {
         const { saveCookies } = await import('./auth.ts');
         const refreshCookie = cookies.find((c: Cookie) => c.name.toLowerCase().includes('refresh'));
-        await saveCookies(email, tokenCookie.value, refreshCookie?.value);
+        await saveCookies(email, tokenCookie.value, refreshCookie?.value, undefined, buildProfileCookies(cookies));
         try {
           await context.close();
         } catch {

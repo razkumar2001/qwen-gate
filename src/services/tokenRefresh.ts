@@ -86,7 +86,7 @@ export async function ensureAccountFresh(acct: AccountEntry): Promise<boolean> {
       const newState = await loginFresh(acct.email, acct.password);
       if (newState) {
         acct.state = newState;
-        await saveCookies(acct.email, newState.token, newState.refreshToken, newState.expiresAt);
+        await saveCookies(acct.email, newState.token, newState.refreshToken, newState.expiresAt, newState.profileCookies);
         return true;
       }
       return false;

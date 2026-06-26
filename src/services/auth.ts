@@ -184,7 +184,7 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
             const newState = await loginFresh(acct.email, acct.password);
             if (newState) {
               acct.state = newState;
-              await saveCookies(acct.email, newState.token, newState.refreshToken, newState.expiresAt);
+              await saveCookies(acct.email, newState.token, newState.refreshToken, newState.expiresAt, newState.profileCookies);
             }
           }),
         );
@@ -230,8 +230,14 @@ export async function loadCookiesFromProfile(email: string): Promise<AuthState |
     const acct = accounts.find((a) => a.email.toLowerCase().trim() === email.toLowerCase().trim());
     const password = acct?.password;
 
-    if (!existsSync(join(profileDir, 'Default', 'Cookies'))) {
-      logStore.log('warn', 'auth', `No profile dir for ${email} — creating via browser login...`);
+    // A profile directory is "real" if it was created by a prior browser launch
+    // (Local State + Default/ are the reliable markers). cloakbrowser may not
+    // materialize Default/Cookies until a session writes it, so checking only
+    // for Cookies caused real profiles to be treated as missing -> a 180s
+    // launchPersistentContext timeout storm on every cold boot.
+    const hasProfile = existsSync(profileDir) && existsSync(join(profileDir, 'Local State'));
+    if (!hasProfile) {
+      logStore.log('warn', `auth`, `No profile dir for ${email} — creating via browser login...`);
       if (password) {
         const { openBrowserProfile } = await import('./browserProfiles.ts');
         let result = await openBrowserProfile(email, password, { headless: true });
@@ -257,14 +263,41 @@ export async function loadCookiesFromProfile(email: string): Promise<AuthState |
     // Stale Chrome singleton files (common on Windows after a hard kill) make
     // launchPersistentContext fail with EPERM -> null -> fresh login -> captcha.
     cleanupSingletonLock(profileDir);
+    // Keep a handle on the launch promise so that if the timeout wins the race,
+    // the eventually-resolved context is still closed instead of leaking a live
+    // Chrome process. Leaked chromes pile up and exhaust resources, which makes
+    // every subsequent launch time out too -> profile-load (and baxia harvest)
+    // permanently breaks.
+    const launchPromise = launchPersistentContext({
+      userDataDir: profileDir,
+      headless: true,
+      args: [...BROWSER_DEFAULT_ARGS],
+    });
+    let launchTimedOut = false;
+    // Reaper: if the timeout wins the race we abandon `launchPromise`, but it
+    // will still resolve to a live Chrome later. Close it then, or it leaks.
+    // Piled-up orphan chromes exhaust resources and make every later launch
+    // time out too -> profile-load (and baxia harvest) permanently breaks.
+    launchPromise
+      .then((ctx: any) => {
+        if (launchTimedOut) {
+          try {
+            ctx?.close?.();
+          } catch {
+            /* best effort */
+          }
+        }
+      })
+      .catch(() => {
+        /* launch failed outright — nothing to reap */
+      });
     context = await Promise.race([
-      launchPersistentContext({
-        userDataDir: profileDir,
-        headless: true,
-        args: [...BROWSER_DEFAULT_ARGS],
-      }),
+      launchPromise,
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Profile launch timed out after 30s')), PROFILE_LAUNCH_TIMEOUT_MS),
+        setTimeout(() => {
+          launchTimedOut = true;
+          reject(new Error('Profile launch timed out after 30s'));
+        }, PROFILE_LAUNCH_TIMEOUT_MS),
       ),
     ]);
 
@@ -373,7 +406,13 @@ export async function loadCookiesFromProfile(email: string): Promise<AuthState |
   return null;
 }
 
-export async function saveCookies(email: string, token: string, refreshToken?: string | null, expiresAt?: number): Promise<void> {
+export async function saveCookies(
+  email: string,
+  token: string,
+  refreshToken?: string | null,
+  expiresAt?: number,
+  profileCookies?: string,
+): Promise<void> {
   const normalizedEmail = email.toLowerCase().trim();
   try {
     // Prefer the real JWT exp over any caller-supplied expiresAt. Login/refresh paths
@@ -394,6 +433,11 @@ export async function saveCookies(email: string, token: string, refreshToken?: s
         expiresAt: jwtExpiresAt,
         refreshToken: refreshToken || acct.state?.refreshToken || null,
       };
+      // Persist baxia/WAF session cookies captured at login so chat requests
+      // can merge them with token= (steady-state WAF-warm). Only overwrite
+      // when the caller actually supplies a fresh set — never clobber existing
+      // cookies with undefined and drop a known-good WAF session.
+      if (profileCookies) acct.profileCookies = profileCookies;
       if (acct.throttledUntil > Date.now()) {
         acct.throttledUntil = 0;
       }
