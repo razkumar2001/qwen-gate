@@ -455,7 +455,18 @@ export function resetWatcherState(): void {
   }
 }
 export function isAvailable(acct: AccountEntry): boolean {
-  if (acct.disabled) return false;
+  if (acct.disabled) {
+    // Auto-rearm a hard-disabled (3x login-fail) account once its recovery
+    // window passes, so a transient outage does not permanently shrink the pool.
+    if (acct.loginFailDisabledUntil && acct.loginFailDisabledUntil <= Date.now()) {
+      acct.disabled = false;
+      acct.loginAttempt = 0;
+      acct.loginFailDisabledUntil = undefined;
+      logStore.log('info', 'auth', `Auto-rearmed ${acct.email} after disable window — retry eligible`);
+    } else {
+      return false;
+    }
+  }
   if (!acct.state) return false;
   if (acct.throttledUntil > Date.now()) return false;
   return true;
@@ -557,10 +568,15 @@ export function isAccountThrottled(email: string): boolean {
 /** Max consecutive failed logins before an account is hard-disabled (configurable). */
 const MAX_LOGIN_ATTEMPTS = config.getInt('MAX_LOGIN_ATTEMPTS', 3);
 const LOGIN_FAIL_THROTTLE_MS = config.getInt('LOGIN_FAIL_THROTTLE_MS', 30 * 60 * 1000);
+/** How long a 3x-failed account stays hard-disabled before auto-rearming
+ *  (so a transient outage does not permanently kill the pool). */
+const LOGIN_FAIL_DISABLE_MS = config.getInt('LOGIN_FAIL_DISABLE_MS', 2 * 60 * 60 * 1000);
 
 /**
  * Record a failed login: bump loginAttempt, throttle the account so the pool
  * stops re-picking it (kills the signin storm), and hard-disable after MAX.
+ * The hard-disable is time-bounded (loginFailDisabledUntil) so a transient
+ * outage re-arms automatically instead of permanently shrinking the pool.
  * Returns the updated attempt count.
  */
 export function recordLoginFailure(email: string): number {
@@ -570,10 +586,11 @@ export function recordLoginFailure(email: string): number {
   acct.throttledUntil = Date.now() + LOGIN_FAIL_THROTTLE_MS;
   if (acct.loginAttempt >= MAX_LOGIN_ATTEMPTS) {
     acct.disabled = true;
+    acct.loginFailDisabledUntil = Date.now() + LOGIN_FAIL_DISABLE_MS;
     logStore.log(
       'error',
       'auth',
-      `Disabling ${email} after ${acct.loginAttempt} failed logins (max ${MAX_LOGIN_ATTEMPTS})`,
+      `Disabling ${email} after ${acct.loginAttempt} failed logins (max ${MAX_LOGIN_ATTEMPTS}) — re-arms in ${Math.ceil(LOGIN_FAIL_DISABLE_MS / 3600000)}h`,
     );
   } else {
     logStore.log(

@@ -20,6 +20,9 @@ export interface AccountEntry {
   loginAttempt: number;
   inFlight: number;
   totalRequests: number;
+  /** ms-epoch after which a hard-disabled (3x login-fail) account auto-rearms.
+   *  Prevents a transient outage from permanently killing the account. */
+  loginFailDisabledUntil?: number;
   /** Full cookie string from browser profile (cna, ssxmod_itna, tfstk, isg, token, etc.) for WAF bypass */
   profileCookies?: string;
   /** Startup lifecycle — 'pending' (added), 'initializing' (boot in progress), 'ready' (fully initialized) */

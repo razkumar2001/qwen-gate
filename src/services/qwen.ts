@@ -277,9 +277,13 @@ export async function createQwenStream(
     // than a JSON FAIL_SYS_USER_VALIDATE. The JSON-only branch below missed it
     // -> generic UpstreamStatusError -> no throttle -> immediate account
     // re-pick -> repeat challenge. Detect it here and treat as captcha.
+    // BUT: a genuine auth-failure 403 (expired/bad token) returns a JSON body,
+    // not a WAF HTML page — only treat as WAF captcha when there is HTML or an
+    // explicit WAF marker, so real auth failures still flow to the JSON branch
+    // (which routes them to re-login) instead of being mislabelled as captcha.
+    const isHtml = contentType.includes('text/html') || /<html|aliyun_waf/i.test(errText);
     const looksLikeWafHtml =
-      response.status === 403 ||
-      contentType.includes('text/html') ||
+      (response.status === 403 && isHtml) ||
       /aliyun_waf|<html|man-machine|captcha/i.test(errText);
     if (looksLikeWafHtml) {
       const details = `WAF challenge (status ${response.status}, ${contentType || 'no-ct'})`;
