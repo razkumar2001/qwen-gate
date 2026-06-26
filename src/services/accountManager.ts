@@ -553,6 +553,48 @@ export function isAccountThrottled(email: string): boolean {
   if (!acct) return true;
   return acct.throttledUntil > Date.now();
 }
+
+/** Max consecutive failed logins before an account is hard-disabled (configurable). */
+const MAX_LOGIN_ATTEMPTS = config.getInt('MAX_LOGIN_ATTEMPTS', 3);
+const LOGIN_FAIL_THROTTLE_MS = config.getInt('LOGIN_FAIL_THROTTLE_MS', 30 * 60 * 1000);
+
+/**
+ * Record a failed login: bump loginAttempt, throttle the account so the pool
+ * stops re-picking it (kills the signin storm), and hard-disable after MAX.
+ * Returns the updated attempt count.
+ */
+export function recordLoginFailure(email: string): number {
+  const acct = getAccountByEmail(email);
+  if (!acct) return 0;
+  acct.loginAttempt += 1;
+  acct.throttledUntil = Date.now() + LOGIN_FAIL_THROTTLE_MS;
+  if (acct.loginAttempt >= MAX_LOGIN_ATTEMPTS) {
+    acct.disabled = true;
+    logStore.log(
+      'error',
+      'auth',
+      `Disabling ${email} after ${acct.loginAttempt} failed logins (max ${MAX_LOGIN_ATTEMPTS})`,
+    );
+  } else {
+    logStore.log(
+      'warn',
+      'auth',
+      `Login fail #${acct.loginAttempt}/${MAX_LOGIN_ATTEMPTS} for ${email} — throttled ${Math.ceil(LOGIN_FAIL_THROTTLE_MS / 60000)}min`,
+    );
+  }
+  saveAccountsToFile(accounts);
+  return acct.loginAttempt;
+}
+
+/** Reset the failed-login counter once a login succeeds. */
+export function resetLoginAttempts(email: string): void {
+  const acct = getAccountByEmail(email);
+  if (!acct) return;
+  if (acct.loginAttempt !== 0) {
+    acct.loginAttempt = 0;
+    saveAccountsToFile(accounts);
+  }
+}
 export function getAccountStats(): Array<{
   email: string;
   authenticated: boolean;
