@@ -70,7 +70,24 @@ interface PersistedAccountData {
   password: string;
   throttledUntil?: number;
   disabled?: boolean;
+  /** Full browser-profile cookie string (baxia/WAF: cna, ssxmod_itna, tfstk, isg, ...). Persisted so WAF cookies survive restart. */
+  profileCookies?: string;
+  /** Auth token state persisted so a restart reuses a still-valid token instead of forcing a captcha-prone fresh login. */
+  token?: string;
+  refreshToken?: string | null;
+  expiresAt?: number;
 }
+
+type LoadedAccount = {
+  email: string;
+  password: string;
+  throttledUntil?: number;
+  disabled?: boolean;
+  profileCookies?: string;
+  token?: string;
+  refreshToken?: string | null;
+  expiresAt?: number;
+};
 export function parseAccountsFromEnv(): Array<{ email: string; password: string }> {
   const result: Array<{ email: string; password: string }> = [];
   for (const [key, value] of Object.entries(process.env)) {
@@ -202,11 +219,15 @@ export function saveAccountsToFile(accounts: readonly AccountEntry[]): void {
       password: a.password, // plaintext
       ...(a.throttledUntil > Date.now() ? { throttledUntil: a.throttledUntil } : {}),
       ...(a.disabled !== undefined ? { disabled: a.disabled } : {}),
+      ...(a.profileCookies ? { profileCookies: a.profileCookies } : {}),
+      ...(a.state?.token
+        ? { token: a.state.token, refreshToken: a.state.refreshToken, expiresAt: a.state.expiresAt }
+        : {}),
     }));
   writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2), 'utf-8');
 }
-export function loadAccountsFromFile(): Array<{ email: string; password: string; throttledUntil?: number; disabled?: boolean }> {
-  const tryLoad = (filePath: string): Array<{ email: string; password: string; throttledUntil?: number; disabled?: boolean }> | null => {
+export function loadAccountsFromFile(): Array<LoadedAccount> {
+  const tryLoad = (filePath: string): Array<LoadedAccount> | null => {
     try {
       if (!existsSync(filePath)) return null;
       const raw = readFileSync(filePath, 'utf-8');
@@ -218,6 +239,10 @@ export function loadAccountsFromFile(): Array<{ email: string; password: string;
           password: decryptPassword(d.password),
           throttledUntil: d.throttledUntil,
           disabled: d.disabled ?? false,
+          profileCookies: d.profileCookies,
+          token: d.token,
+          refreshToken: d.refreshToken,
+          expiresAt: d.expiresAt,
         }));
     } catch (err: any) {
       logStore.log('error', 'auth', `Failed to load ${filePath}: ${err.message}`);
@@ -560,7 +585,7 @@ export async function getToken(): Promise<string | null> {
   }
   return null;
 }
-export async function getTokenWithAccount(email?: string): Promise<{ token: string; email: string } | null> {
+export async function getTokenWithAccount(email?: string): Promise<{ token: string; email: string; cookie: string } | null> {
   let acct: AccountEntry | null;
   let picked = false;
   if (email) {
@@ -578,5 +603,15 @@ export async function getTokenWithAccount(email?: string): Promise<{ token: stri
   }
   acct.lastUsed = Date.now();
   if (picked) decrementInFlight(acct.email);
-  return { token: acct.state.token, email: acct.email };
+  // Build the full request cookie: fresh JWT first, then the baxia/WAF profile cookies
+  // (cna, ssxmod_itna, tfstk, isg, ...) with any stale token= stripped to avoid duplicates.
+  // Sending only token= (the old behavior) makes every API request WAF-cold -> captcha.
+  const profile = acct.profileCookies
+    ? acct.profileCookies
+        .replace(/\btoken=[^;]+;?\s*/g, '')
+        .replace(/;+$/, '')
+        .trim()
+    : '';
+  const cookie = profile ? `token=${acct.state.token}; ${profile}` : `token=${acct.state.token}`;
+  return { token: acct.state.token, email: acct.email, cookie };
 }

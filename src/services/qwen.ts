@@ -357,7 +357,7 @@ export async function createQwenStream(
 
     // Browserless path: impers worker for TLS/HTTP2 impersonation, cookie from account manager
     const tokenInfo = currentAccountEmail ? await getTokenWithAccount(currentAccountEmail) : null;
-    const cookieStr = tokenInfo ? `token=${tokenInfo.token}` : '';
+    const cookieStr = tokenInfo ? tokenInfo.cookie : '';
     const tokenPreview = cookieStr ? cookieStr.substring(0, 20) + '...' : 'none';
 
     logStore.log(

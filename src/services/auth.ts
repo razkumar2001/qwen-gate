@@ -19,6 +19,7 @@ import {
   migrateFromOldPaths,
   rebuildEmailIndex,
   resetWatcherState,
+  saveAccountsToFile,
   setupAccountWatcher as setupAccountWatcherImpl,
 } from './accountManager.ts';
 import { config } from './configService.ts';
@@ -84,7 +85,7 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
   const discovered = discoverSavedAccounts();
 
   // Merge persisted accounts (which may include throttledUntil and profileCookies) with discovered accounts
-  const merged: Array<{ email: string; password: string; throttledUntil?: number; disabled?: boolean; profileCookies?: string }> = [
+  const merged: Array<{ email: string; password: string; throttledUntil?: number; disabled?: boolean; profileCookies?: string; token?: string; refreshToken?: string | null; expiresAt?: number }> = [
     ...discovered,
   ];
   for (const p of persisted) {
@@ -99,6 +100,12 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
       }
       if (p.disabled !== undefined) {
         existing.disabled = p.disabled;
+      }
+      if (p.profileCookies) existing.profileCookies = p.profileCookies;
+      if (p.token) {
+        existing.token = p.token;
+        existing.refreshToken = p.refreshToken;
+        existing.expiresAt = p.expiresAt;
       }
     } else if (p.password) {
       merged.push(p);
@@ -122,7 +129,10 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
     accounts.push({
       email: a.email,
       password: a.password,
-      state: null,
+      state:
+        a.token && a.expiresAt && a.expiresAt > Date.now()
+          ? { token: a.token, expiresAt: a.expiresAt, refreshToken: a.refreshToken ?? null }
+          : null,
       lastUsed: 0,
       throttledUntil: persistedUntil > Date.now() ? persistedUntil : 0,
       refreshInFlight: null,
@@ -145,6 +155,11 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
       const batch = accounts.slice(i, i + MAX_CONCURRENT_PROFILE_LOADS);
       const batchResults = await Promise.allSettled(
         batch.map(async (acct) => {
+          // Already hydrated from persisted token (still valid) — skip the expensive,
+          // lock-prone browser profile launch and the captcha-prone fresh login.
+          if (acct.state?.token && acct.state.expiresAt > Date.now()) {
+            return { acct, source: 'persisted' as const };
+          }
           const profileState = await loadCookiesFromProfile(acct.email);
           if (profileState) {
             acct.state = profileState;
@@ -357,14 +372,15 @@ export async function loadCookiesFromProfile(email: string): Promise<AuthState |
 export async function saveCookies(email: string, token: string, refreshToken?: string | null, expiresAt?: number): Promise<void> {
   const normalizedEmail = email.toLowerCase().trim();
   try {
-    let jwtExpiresAt = expiresAt;
-    if (!jwtExpiresAt) {
-      const payload = decodeJwt(token);
-      if (payload?.exp && typeof payload.exp === 'number') {
-        jwtExpiresAt = payload.exp * 1000;
-      } else {
-        jwtExpiresAt = Date.now() + getAuthTokenMaxAgeMs();
-      }
+    // Prefer the real JWT exp over any caller-supplied expiresAt. Login/refresh paths
+    // hardcode now+8h, which forces a captcha-prone re-login long before the token's real
+    // expiry. The JWT's own exp is authoritative whenever it is decodable.
+    let jwtExpiresAt: number;
+    const payload = decodeJwt(token);
+    if (payload?.exp && typeof payload.exp === 'number') {
+      jwtExpiresAt = payload.exp * 1000;
+    } else {
+      jwtExpiresAt = expiresAt ?? Date.now() + getAuthTokenMaxAgeMs();
     }
 
     const acct = accounts.find((a) => a.email.toLowerCase().trim() === normalizedEmail);
@@ -378,7 +394,9 @@ export async function saveCookies(email: string, token: string, refreshToken?: s
         acct.throttledUntil = 0;
       }
 
-      // Token lives in browser profile's Default/Cookies SQLite — no separate file needed
+      // Persist token state to accounts.json so a restart reuses a still-valid token
+      // instead of forcing a fresh (captcha-prone) login. profileCookies persist too.
+      saveAccountsToFile(accounts);
     }
   } catch (err: any) {
     logStore.log('error', 'auth', `Failed to save cookies for ${normalizedEmail}: ${err.message}`);
