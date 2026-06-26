@@ -251,8 +251,12 @@ export async function loadCookiesFromProfile(email: string): Promise<AuthState |
 
     logStore.log('info', 'auth', `Loading token from profile for ${email}...`);
     const { BROWSER_DEFAULT_ARGS } = await import('./playwright.ts');
+    const { cleanupSingletonLock } = await import('./browserProfiles.ts');
     const { launchPersistentContext } = await import('cloakbrowser');
     const PROFILE_LAUNCH_TIMEOUT_MS = 30_000;
+    // Stale Chrome singleton files (common on Windows after a hard kill) make
+    // launchPersistentContext fail with EPERM -> null -> fresh login -> captcha.
+    cleanupSingletonLock(profileDir);
     context = await Promise.race([
       launchPersistentContext({
         userDataDir: profileDir,

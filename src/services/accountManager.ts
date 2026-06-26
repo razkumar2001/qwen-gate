@@ -122,6 +122,20 @@ export function decodeJwt(token: string): Record<string, any> | null {
     return null;
   }
 }
+
+/**
+ * Resolve a token's real expiry (ms epoch) from its own JWT `exp` claim.
+ * Falls back to `fallbackMs` from now when the JWT is undecodable or has no exp.
+ * Use this everywhere a token enters RAM state so the live process honors the
+ * token's true lifetime instead of force-refreshing on a hardcoded 8h timer.
+ */
+export function tokenExpiresAt(token: string, fallbackMs: number): number {
+  const payload = decodeJwt(token);
+  if (payload?.exp && typeof payload.exp === 'number') {
+    return payload.exp * 1000;
+  }
+  return Date.now() + fallbackMs;
+}
 /* ── AES-256-GCM password encryption ── */
 const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 16;

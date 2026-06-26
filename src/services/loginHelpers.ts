@@ -7,6 +7,7 @@
 import crypto from 'crypto';
 import type { AuthState } from '../types/auth.ts';
 import { checkPlaywrightSession, getAuthTokenMaxAgeMs } from './auth.ts';
+import { tokenExpiresAt } from './accountManager.ts';
 import { logStore } from './logStore.ts';
 import { AccountContext, createAccountContext, getActivePage, getBrowser, Mutex } from './playwright.ts';
 import { createFetchTimeout, QWEN_BX_V } from './qwen.ts';
@@ -124,7 +125,7 @@ export async function loginFreshViaBrowser(email: string, hashedPassword: string
     if (finalToken) {
       return {
         token: finalToken,
-        expiresAt: Date.now() + getAuthTokenMaxAgeMs(),
+        expiresAt: tokenExpiresAt(finalToken, getAuthTokenMaxAgeMs()),
         refreshToken: finalRefresh,
       };
     }
@@ -192,7 +193,7 @@ export async function loginFreshViaFetch(email: string, hashedPassword: string):
       if (token) {
         return {
           token,
-          expiresAt: Date.now() + getAuthTokenMaxAgeMs(),
+          expiresAt: tokenExpiresAt(token, getAuthTokenMaxAgeMs()),
           refreshToken,
         };
       }
@@ -315,7 +316,7 @@ export async function loginViaTempContext(
     if (capturedToken) {
       return {
         token: capturedToken,
-        expiresAt: Date.now() + getAuthTokenMaxAgeMs(),
+        expiresAt: tokenExpiresAt(capturedToken, getAuthTokenMaxAgeMs()),
         refreshToken: capturedRefresh,
       };
     }

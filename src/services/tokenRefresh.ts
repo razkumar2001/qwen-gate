@@ -6,6 +6,7 @@
 
 import type { AccountEntry } from '../types/auth.ts';
 import { getAuthRefreshBeforeMs, getAuthTokenMaxAgeMs, saveCookies } from './auth.ts';
+import { tokenExpiresAt } from './accountManager.ts';
 import { browserlessFetch } from './browserlessFetch.ts';
 import { loginFresh } from './loginService.ts';
 import { logStore } from './logStore.ts';
@@ -34,7 +35,7 @@ export async function tryRefreshToken(acct: AccountEntry): Promise<boolean> {
 
     acct.state = {
       token: data.data.token,
-      expiresAt: Date.now() + getAuthTokenMaxAgeMs(),
+      expiresAt: tokenExpiresAt(data.data.token, getAuthTokenMaxAgeMs()),
       refreshToken: data.data.refresh_token || acct.state.refreshToken,
     };
     await saveCookies(acct.email, acct.state.token, acct.state.refreshToken, acct.state.expiresAt);
@@ -61,6 +62,19 @@ export async function ensureAccountFresh(acct: AccountEntry): Promise<boolean> {
       if (acct.state?.refreshToken) {
         if (await tryRefreshToken(acct)) return true;
         logStore.log('warn', 'auth', `Refresh token failed for ${acct.email}`);
+      }
+
+      // Silent captcha-free refresh: re-launch the real browser profile (which
+      // carries persisted baxia/WAF cookies) and let Qwen rotate the token cookie
+      // on navigation. Avoids the captcha-prone plain-fetch signin below.
+      try {
+        const { refreshViaProfile } = await import('./browserProfiles.ts');
+        if (await refreshViaProfile(acct.email)) {
+          logStore.log('info', 'auth', `Token rotated via profile for ${acct.email} (no login)`);
+          return true;
+        }
+      } catch (err: any) {
+        logStore.log('warn', 'auth', `refreshViaProfile failed for ${acct.email}: ${err.message}`);
       }
 
       if (acct.throttledUntil > Date.now()) {

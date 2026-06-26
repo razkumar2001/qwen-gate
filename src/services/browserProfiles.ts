@@ -27,7 +27,7 @@ export function getProfileDir(email: string): string {
 }
 
 /** Remove stale Chrome singleton files that block new instances from starting on this profile. */
-function cleanupSingletonLock(profileDir: string): void {
+export function cleanupSingletonLock(profileDir: string): void {
   for (const name of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
     try {
       const f = join(profileDir, name);
@@ -70,7 +70,10 @@ async function setupBrowserContext(email: string, headless: boolean): Promise<an
 async function checkExistingToken(context: any): Promise<boolean> {
   const existingCookies: Cookie[] = await context.cookies();
   const existingToken = existingCookies.find((c: Cookie) => c.name === 'token');
-  return !!(existingToken && existingToken.expires && existingToken.expires * 1000 > Date.now());
+  if (!existingToken) return false;
+  // expires <= 0 (e.g. -1) means a session cookie with no expiry -> treat as valid.
+  // Only reject cookies with a real expiry already in the past.
+  return existingToken.expires <= 0 || existingToken.expires * 1000 > Date.now();
 }
 
 async function fillLoginForm(page: any, email: string, password: string): Promise<void> {
@@ -231,6 +234,9 @@ export async function refreshViaProfile(email: string): Promise<boolean> {
   let context: any = null;
 
   try {
+    // Stale Chrome singleton files block the launch -> null -> fall through to
+    // captcha-prone loginFresh. Clear them first (same as setupBrowserContext).
+    cleanupSingletonLock(profileDir);
     context = await cloakPersistentContext({
       userDataDir: profileDir,
       headless: true,
